@@ -145,6 +145,141 @@ def content_similar_anime(
     return result.reset_index(drop=True)
 
 
+MOOD_GENRE_MAP = {
+    "Không chọn": [],
+    "Nhẹ nhàng": ["Comedy", "Slice of Life", "Romance"],
+    "Hanh động": ["Action", "Adventure", "Super Power", "Martial Arts"],
+    "Drama": ["Drama", "Romance", "School"],
+    "Hồi hộp / bí ẩn": ["Mystery", "Psychological", "Thriller", "Horror"],
+    "Phiêu lưu / fantasy": ["Adventure", "Fantasy", "Magic", "Supernatural"],
+}
+
+
+def get_available_genres(anime_lookup: pd.DataFrame) -> list[str]:
+    genre_values = anime_lookup.get("genre", pd.Series(dtype=str)).dropna().astype(str)
+    genres = {genre.strip() for value in genre_values for genre in value.split(",") if genre.strip()}
+    return sorted(genres)
+
+
+def add_popularity_features(
+    anime_lookup: pd.DataFrame,
+    selected_genres: list[str] | None = None,
+) -> pd.DataFrame:
+    result = anime_lookup.copy()
+    selected_genres = selected_genres or []
+    selected_genre_set = set(selected_genres)
+
+    genre_text = result.get("genre", pd.Series("", index=result.index)).fillna("").astype(str)
+    if selected_genre_set:
+        result["genre_match_count"] = genre_text.apply(
+            lambda value: len({part.strip() for part in value.split(",")} & selected_genre_set)
+        )
+    else:
+        result["genre_match_count"] = 0
+
+    rating = pd.to_numeric(result.get("rating", pd.Series(0, index=result.index)), errors="coerce").fillna(0.0)
+    members = pd.to_numeric(result.get("members", pd.Series(0, index=result.index)), errors="coerce").fillna(0.0)
+    members = np.log1p(members)
+
+    rating_range = rating.max() - rating.min()
+    members_range = members.max() - members.min()
+    rating_norm = (rating - rating.min()) / (rating_range if rating_range else 1.0)
+    members_norm = (members - members.min()) / (members_range if members_range else 1.0)
+
+    result["popularity_score"] = (
+        0.62 * rating_norm
+        + 0.33 * members_norm
+        + 0.05 * np.minimum(result["genre_match_count"], 3) / 3
+    )
+    return result
+
+
+def filter_preference_segment(
+    anime_lookup: pd.DataFrame,
+    selected_genres: list[str],
+    selected_types: list[str],
+    mood: str,
+) -> tuple[pd.DataFrame, list[str]]:
+    mood_genres = MOOD_GENRE_MAP.get(mood, [])
+    target_genres = list(dict.fromkeys([*selected_genres, *mood_genres]))
+    segment = anime_lookup.copy()
+
+    if selected_types:
+        type_text = segment.get("type", pd.Series("", index=segment.index)).fillna("").astype(str)
+        segment = segment[type_text.isin(selected_types)].copy()
+
+    if target_genres:
+        genre_set = set(target_genres)
+        genre_text = segment.get("genre", pd.Series("", index=segment.index)).fillna("").astype(str)
+        segment = segment[
+            genre_text.apply(lambda value: bool({part.strip() for part in value.split(",")} & genre_set))
+        ].copy()
+
+    segment = add_popularity_features(segment, target_genres)
+    segment = segment.sort_values(["genre_match_count", "popularity_score"], ascending=False)
+    return segment.reset_index(drop=True), target_genres
+
+
+def dynamic_content_alpha(n_known: int, c: float = 8.0, alpha_min: float = 0.2, alpha_max: float = 0.9) -> float:
+    return float(np.clip(c / (c + max(n_known, 0)), alpha_min, alpha_max))
+
+
+def recommend_for_new_viewer(
+    anime_lookup: pd.DataFrame,
+    content_matrix: csr_matrix,
+    selected_genres: list[str],
+    selected_types: list[str],
+    mood: str,
+    known_anime_ids: list[int],
+    top_k: int = 10,
+    refresh_page: int = 0,
+) -> tuple[pd.DataFrame, float, str]:
+    segment, target_genres = filter_preference_segment(
+        anime_lookup=anime_lookup,
+        selected_genres=selected_genres,
+        selected_types=selected_types,
+        mood=mood,
+    )
+    alpha = dynamic_content_alpha(len(known_anime_ids))
+    if segment.empty:
+        return pd.DataFrame(), alpha, "empty"
+
+    id_to_idx = {anime_id: idx for idx, anime_id in enumerate(anime_lookup["anime_id"].tolist())}
+    known_anime_ids = [int(anime_id) for anime_id in known_anime_ids if int(anime_id) in id_to_idx]
+    candidate = segment[~segment["anime_id"].isin(known_anime_ids)].copy()
+
+    if known_anime_ids:
+        known_indices = [id_to_idx[anime_id] for anime_id in known_anime_ids]
+        profile_vector = content_matrix[known_indices].mean(axis=0)
+        content_scores = np.asarray(content_matrix @ profile_vector.T).ravel().astype(np.float32)
+        candidate["content_score"] = candidate["anime_id"].map(
+            {anime_id: float(content_scores[idx]) for anime_id, idx in id_to_idx.items()}
+        )
+        alpha = dynamic_content_alpha(len(known_anime_ids))
+        candidate["recommendation_score"] = (
+            alpha * candidate["content_score"].fillna(0.0)
+            + (1.0 - alpha) * candidate["popularity_score"].fillna(0.0)
+        )
+        reason = "profile"
+    else:
+        candidate["content_score"] = np.nan
+        candidate["recommendation_score"] = candidate["popularity_score"]
+        reason = "segment_popular"
+
+    candidate = candidate.sort_values(
+        ["recommendation_score", "genre_match_count", "popularity_score"],
+        ascending=False,
+    )
+    start = max(int(refresh_page), 0) * top_k
+    if start >= len(candidate):
+        start = 0
+
+    columns = ["anime_id", "name", "genre", "type", "rating", "members", "recommendation_score"]
+    result = candidate.iloc[start : start + top_k][columns].copy()
+    result["matched_genres"] = ", ".join(target_genres) if target_genres else "All"
+    return result.reset_index(drop=True), alpha, reason
+
+
 def show_query_result(
     model: ExplicitALSRecommender,
     anime_lookup: pd.DataFrame,
@@ -192,36 +327,36 @@ def show_query_result(
     )
 
 
-def show_recommendations(
-    model: ExplicitALSRecommender,
+def show_new_viewer_recommendations(
     anime_lookup: pd.DataFrame,
     content_matrix: csr_matrix,
-    user_id: int,
-    top_k: int,
-    cold_start_anime_id: int,
+    selected_genres: list[str],
+    selected_types: list[str],
+    mood: str,
+    known_anime_ids: list[int],
+    refresh_page: int,
 ) -> None:
-    if user_id not in model.user_to_idx:
-        seed_row = anime_lookup[anime_lookup["anime_id"] == cold_start_anime_id]
-        seed_name = seed_row.iloc[0]["name"] if not seed_row.empty else str(cold_start_anime_id)
-        st.info(
-            "User này chưa có rating trong dữ liệu train. "
-            f"Đang dùng content-based từ anime seed: {seed_name}."
-        )
-        recommendations_df = content_similar_anime(
-            anime_lookup=anime_lookup,
-            content_matrix=content_matrix,
-            query_anime_id=cold_start_anime_id,
-            top_k=top_k,
-        )
-        st.success(f"Top {top_k} content-based recommendations")
-        st.dataframe(
-            recommendations_df[["anime_id", "name", "genre", "type", "content_similarity"]],
-            use_container_width=True,
-        )
+    recommendations_df, alpha, reason = recommend_for_new_viewer(
+        anime_lookup=anime_lookup,
+        content_matrix=content_matrix,
+        selected_genres=selected_genres,
+        selected_types=selected_types,
+        mood=mood,
+        known_anime_ids=known_anime_ids,
+        top_k=10,
+        refresh_page=refresh_page,
+    )
+
+    if recommendations_df.empty:
+        st.warning("Không tìm thấy anime phù hợp với bộ lọc này. Hãy chọn ít thể loại/type hơn.")
         return
 
-    recommendations_df = model.recommend(user_id, anime_lookup, top_k=top_k)
-    st.success(f"Top {top_k} recommendations for user {user_id}")
+    if reason == "profile":
+        st.info(f"Đã tạo hồ sơ từ {len(known_anime_ids)} anime bạn tick. Content alpha = {alpha:.2f}.")
+    else:
+        st.info("Bạn chưa tick anime quen thuộc, nên he thống dùng Top Popular trong các phân khúc bạn chọn.")
+
+    st.success("10 anime gợi ý cho bạn")
     st.dataframe(
         recommendations_df[
             [
@@ -229,15 +364,18 @@ def show_recommendations(
                 "name",
                 "genre",
                 "type",
-                "predicted_rating",
+                "rating",
+                "members",
+                "recommendation_score",
             ]
         ],
         use_container_width=True,
     )
+    return
 
-
-st.title("Anime Hybrid Recommender")
+st.title("Anime Recommender System")
 st.write("Hybrid = ALS collaborative similarity + content similarity from genre, type, rating, and members.")
+st.write("Power by Save AI")
 
 with st.sidebar:
     st.header("Training")
@@ -315,6 +453,65 @@ with tab_id:
             st.error(str(exc))
 
 with tab_recommendations:
+    st.subheader("Chào bạn, bạn thích xem gì hôm nay?")
+    st.write("Chọn nhanh so thich, hệ thống se gợi ý 10 anime phù hợp.")
+
+    available_genres = get_available_genres(anime_lookup_full)
+    available_types = sorted(anime_lookup_full["type"].dropna().astype(str).unique().tolist())
+
+    selected_genres = st.multiselect(
+        "Thể loại bạn thích (chọn 2-3 mục)",
+        available_genres,
+        default=[genre for genre in ["Action", "Comedy", "Drama"] if genre in available_genres][:2],
+    )
+    selected_types = st.multiselect(
+        "Định dạng anime bạn thích",
+        available_types,
+        default=[anime_type for anime_type in ["TV", "Movie"] if anime_type in available_types],
+    )
+    mood = st.selectbox("Mood / mục tiêu xem", list(MOOD_GENRE_MAP.keys()), index=0)
+
+    starter_segment, _ = filter_preference_segment(
+        anime_lookup_full,
+        selected_genres=selected_genres,
+        selected_types=selected_types,
+        mood=mood,
+    )
+    starter_options = starter_segment.head(30)
+    starter_name_map = dict(zip(starter_options["anime_id"], starter_options["name"]))
+    known_anime_ids = st.multiselect(
+        "Tick vài anime bạn đã biết (có thể bỏ qua)",
+        starter_options["anime_id"].tolist(),
+        format_func=lambda anime_id: starter_name_map.get(anime_id, str(anime_id)),
+        help="Nếu tick 3-5 anime, hệ thống sẽ tạo content profile ban đầu. Nếu bỏ qua, sẽ dùng Top Popular theo phân khúc.",
+    )
+
+    refresh_page = st.number_input(
+        "Làm mới / khám phá trang",
+        min_value=0,
+        max_value=20,
+        value=0,
+        step=1,
+        help="Tăng sô này để xem 10 gợi ý tiếp theo trong cung phân khúc.",
+    )
+
+    if st.button("Recommend 10 anime", key="get_new_viewer_recommendations"):
+        try:
+            show_new_viewer_recommendations(
+                anime_lookup_full,
+                content_matrix,
+                selected_genres,
+                selected_types,
+                mood,
+                [int(anime_id) for anime_id in known_anime_ids],
+                int(refresh_page),
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+
+    st.caption("The model is trained from rating.csv and anime metadata in anime.csv.")
+    st.stop()
+
     seed_anime_name_map = dict(zip(anime_lookup_full["anime_id"], anime_lookup_full["name"]))
     user_id_input = st.number_input(
         "Enter user_id",
