@@ -13,6 +13,9 @@ from sklearn.preprocessing import normalize
 
 from als_recommender import ALSConfig, ExplicitALSRecommender
 
+import requests
+import urllib.parse
+
 
 BASE_DIR = Path(__file__).resolve().parent
 RATINGS_PATH = BASE_DIR / "anime data" / "rating.csv"
@@ -280,6 +283,47 @@ def recommend_for_new_viewer(
     return result.reset_index(drop=True), alpha, reason
 
 
+def get_poster_by_name(anime_name):
+    """Tìm kiếm poster dựa trên tên anime qua Jikan API"""
+    try:
+        # Mã hóa tên để tránh lỗi khi tên có khoảng trắng hoặc ký tự đặc biệt
+        encoded_name = urllib.parse.quote(anime_name)
+        url = f"https://api.jikan.moe/v4/anime?q={encoded_name}&limit=1"
+        
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            if data['data']:
+                return data['data'][0]['images']['jpg']['image_url']
+        return "https://via.placeholder.com/225x350?text=No+Image"
+    except:
+        return "https://via.placeholder.com/225x350?text=Error"
+    
+
+def display_anime_cards(df, columns_per_row=5):
+    """Hiển thị lưới anime với ảnh lấy theo tên"""
+    n_results = len(df)
+    if n_results == 0:
+        return
+
+    for i in range(0, n_results, columns_per_row):
+        cols = st.columns(columns_per_row)
+        batch = df.iloc[i : i + columns_per_row]
+        
+        for idx, (index, row) in enumerate(batch.iterrows()):
+            with cols[idx]:
+                # Sử dụng cột 'name' trong dataframe để tìm poster
+                poster_url = get_poster_by_name(row['name'])
+                st.image(poster_url, use_container_width=True)
+                
+                # Hiển thị tên anime rút gọn
+                display_name = row['name']
+                st.markdown(f"**{display_name[:40]}{'...' if len(display_name) > 40 else ''}**")
+                
+                # Hiển thị điểm số nếu có[cite: 1]
+                if 'hybrid_score' in row:
+                    st.caption(f"Score: {row['hybrid_score']:.2f}")
+
 def show_query_result(
     model: ExplicitALSRecommender,
     anime_lookup: pd.DataFrame,
@@ -298,10 +342,7 @@ def show_query_result(
             top_k=top_k,
         )
         st.success(f"Top {top_k} anime similar to: {query_name} (content-based)")
-        st.dataframe(
-            similar_df[["anime_id", "name", "genre", "type", "content_similarity"]],
-            use_container_width=True,
-        )
+        display_anime_cards(similar_df, columns_per_row=5)
         return
 
     similar_df = model.hybrid_similar_anime(
@@ -311,20 +352,7 @@ def show_query_result(
         content_weight=content_weight,
     )
     st.success(f"Top {top_k} anime similar to: {query_name}")
-    st.dataframe(
-        similar_df[
-            [
-                "anime_id",
-                "name",
-                "genre",
-                "type",
-                "hybrid_score",
-                "als_similarity",
-                "content_similarity",
-            ]
-        ],
-        use_container_width=True,
-    )
+    display_anime_cards(similar_df, columns_per_row=5)
 
 
 def show_new_viewer_recommendations(
@@ -357,20 +385,8 @@ def show_new_viewer_recommendations(
         st.info("Bạn chưa tick anime quen thuộc, nên he thống dùng Top Popular trong các phân khúc bạn chọn.")
 
     st.success("10 anime gợi ý cho bạn")
-    st.dataframe(
-        recommendations_df[
-            [
-                "anime_id",
-                "name",
-                "genre",
-                "type",
-                "rating",
-                "members",
-                "recommendation_score",
-            ]
-        ],
-        use_container_width=True,
-    )
+    display_anime_cards(recommendations_df, columns_per_row=5)
+    
     return
 
 st.title("Anime Recommender System")
@@ -540,3 +556,8 @@ with tab_recommendations:
             st.error(str(exc))
 
 st.caption("The model is trained from rating.csv and anime metadata in anime.csv.")
+
+
+
+
+
