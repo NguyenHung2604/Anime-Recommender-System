@@ -1,0 +1,7 @@
+{
+  "n_users": 495,
+  "n_items": 3800,
+  "n_factors": 32,
+  "n_iters": 15,
+  "reg": 0.1
+}
