@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+from difflib import SequenceMatcher
 
 import numpy as np
 import pandas as pd
@@ -22,6 +23,7 @@ ANIME_PATH = BASE_DIR / "anime data" / "anime.csv"
 st.set_page_config(page_title="Anime Hybrid Recommender", layout="wide")
 
 NAME_CLEANING_VERSION = "v2"
+RECOMMENDER_VERSION = "title_similarity_v1"
 
 
 def clean_anime_name(name: object) -> str:
@@ -56,7 +58,9 @@ def train_model(
     n_iters: int,
     reg: float,
     random_state: int,
+    recommender_version: str = RECOMMENDER_VERSION,
 ) -> tuple[ExplicitALSRecommender, pd.DataFrame]:
+    _ = recommender_version
     ratings_df, anime_df = load_data(max_rows=max_rows, cleaning_version=NAME_CLEANING_VERSION)
     model = ExplicitALSRecommender(
         ALSConfig(
@@ -115,18 +119,96 @@ def build_content_lookup_and_matrix(anime_df: pd.DataFrame) -> tuple[pd.DataFram
     return anime_lookup, content_matrix
 
 
+def normalize_title(title: object) -> str:
+    if pd.isna(title):
+        return ""
+
+    text = html.unescape(str(title)).casefold()
+    text = re.sub(r"\([^)]*\)", " ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def title_similarity_scores(anime_lookup: pd.DataFrame, query_idx: int) -> np.ndarray:
+    query_title = normalize_title(anime_lookup.iloc[query_idx].get("name", ""))
+    query_tokens = set(query_title.split())
+    scores = np.zeros(len(anime_lookup), dtype=np.float32)
+
+    if not query_title:
+        return scores
+
+    for idx, candidate_name in enumerate(anime_lookup.get("name", pd.Series("", index=anime_lookup.index))):
+        candidate_title = normalize_title(candidate_name)
+        if not candidate_title:
+            continue
+
+        candidate_tokens = set(candidate_title.split())
+        token_score = (
+            len(query_tokens & candidate_tokens) / len(query_tokens | candidate_tokens)
+            if query_tokens and candidate_tokens
+            else 0.0
+        )
+        sequence_score = SequenceMatcher(None, query_title, candidate_title).ratio()
+
+        if candidate_title == query_title:
+            score = 1.0
+        elif candidate_title.startswith(f"{query_title} ") or query_title.startswith(f"{candidate_title} "):
+            score = 0.95
+        elif query_title in candidate_title or candidate_title in query_title:
+            score = 0.9
+        else:
+            score = max(token_score, sequence_score * 0.75)
+
+        scores[idx] = float(score)
+
+    scores[query_idx] = -np.inf
+    return scores
+
+
+def add_title_similarity_if_missing(
+    similar_df: pd.DataFrame,
+    anime_lookup: pd.DataFrame,
+    query_anime_id: int,
+) -> pd.DataFrame:
+    if "title_similarity" in similar_df.columns:
+        return similar_df
+
+    id_to_idx = {anime_id: idx for idx, anime_id in enumerate(anime_lookup["anime_id"].tolist())}
+    if query_anime_id not in id_to_idx:
+        similar_df = similar_df.copy()
+        similar_df["title_similarity"] = np.nan
+        return similar_df
+
+    scores = title_similarity_scores(anime_lookup, id_to_idx[query_anime_id])
+    score_by_id = {
+        int(anime_id): float(scores[idx])
+        for anime_id, idx in id_to_idx.items()
+    }
+    similar_df = similar_df.copy()
+    similar_df["title_similarity"] = similar_df["anime_id"].map(score_by_id)
+    return similar_df
+
+
+def existing_columns(frame: pd.DataFrame, columns: list[str]) -> list[str]:
+    return [column for column in columns if column in frame.columns]
+
+
 def content_similar_anime(
     anime_lookup: pd.DataFrame,
     content_matrix: csr_matrix,
     query_anime_id: int,
     top_k: int,
+    title_weight: float = 0.55,
 ) -> pd.DataFrame:
     id_to_idx = {anime_id: idx for idx, anime_id in enumerate(anime_lookup["anime_id"].tolist())}
     if query_anime_id not in id_to_idx:
         raise ValueError(f"Anime id {query_anime_id} not found in anime metadata.")
 
     query_idx = id_to_idx[query_anime_id]
-    scores = (content_matrix @ content_matrix[query_idx].T).toarray().ravel().astype(np.float32)
+    content_scores = (content_matrix @ content_matrix[query_idx].T).toarray().ravel().astype(np.float32)
+    title_scores = title_similarity_scores(anime_lookup, query_idx)
+    title_weight = float(np.clip(title_weight, 0.0, 1.0))
+    scores = (1.0 - title_weight) * content_scores + title_weight * title_scores
     scores[query_idx] = -np.inf
 
     n_items = len(scores)
@@ -142,6 +224,8 @@ def content_similar_anime(
 
     result = anime_lookup.iloc[top_indices][["anime_id", "name", "genre", "type"]].copy()
     result["content_similarity"] = scores[top_indices]
+    result["metadata_similarity"] = content_scores[top_indices]
+    result["title_similarity"] = title_scores[top_indices]
     return result.reset_index(drop=True)
 
 
@@ -299,7 +383,20 @@ def show_query_result(
         )
         st.success(f"Top {top_k} anime similar to: {query_name} (content-based)")
         st.dataframe(
-            similar_df[["anime_id", "name", "genre", "type", "content_similarity"]],
+            similar_df[
+                existing_columns(
+                    similar_df,
+                    [
+                        "anime_id",
+                        "name",
+                        "genre",
+                        "type",
+                        "content_similarity",
+                        "metadata_similarity",
+                        "title_similarity",
+                    ],
+                )
+            ],
             use_container_width=True,
         )
         return
@@ -310,18 +407,23 @@ def show_query_result(
         top_k=top_k,
         content_weight=content_weight,
     )
+    similar_df = add_title_similarity_if_missing(similar_df, anime_lookup, query_anime_id)
     st.success(f"Top {top_k} anime similar to: {query_name}")
     st.dataframe(
         similar_df[
-            [
-                "anime_id",
-                "name",
-                "genre",
-                "type",
-                "hybrid_score",
-                "als_similarity",
-                "content_similarity",
-            ]
+            existing_columns(
+                similar_df,
+                [
+                    "anime_id",
+                    "name",
+                    "genre",
+                    "type",
+                    "hybrid_score",
+                    "als_similarity",
+                    "content_similarity",
+                    "title_similarity",
+                ],
+            )
         ],
         use_container_width=True,
     )
@@ -398,7 +500,7 @@ with st.sidebar:
 
 
 with st.spinner("Training ALS model..."):
-    model, anime_df = train_model(max_rows, n_factors, n_iters, reg, int(random_state))
+    model, anime_df = train_model(max_rows, n_factors, n_iters, reg, int(random_state), RECOMMENDER_VERSION)
 
 trained_item_ids = set(model.item_ids.tolist()) if model.item_ids is not None else set()
 anime_lookup_full, content_matrix = build_content_lookup_and_matrix(anime_df)

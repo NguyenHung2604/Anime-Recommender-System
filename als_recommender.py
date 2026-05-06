@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import pickle
+import re
 import sys
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import numpy as np
@@ -229,6 +232,58 @@ class ExplicitALSRecommender:
 
         return normalize(hstack([genre_features, type_features, numeric_features]).tocsr())
 
+    def _normalize_title(self, title: object) -> str:
+        if pd.isna(title):
+            return ""
+
+        text = html.unescape(str(title)).casefold()
+        text = re.sub(r"\([^)]*\)", " ", text)
+        text = re.sub(r"[^a-z0-9]+", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _title_similarity_scores(self, anime_id: int, anime_df: pd.DataFrame) -> np.ndarray:
+        if self.item_ids is None:
+            raise ValueError("Model has not been fit yet.")
+        if anime_id not in self.item_to_idx:
+            raise ValueError(f"Anime id {anime_id} is not available in the trained ALS model.")
+
+        anime_lookup = self._prepare_anime_lookup(anime_df)
+        item_frame = anime_lookup.reindex(self.item_ids)
+        query_name = item_frame.loc[anime_id, "name"] if anime_id in item_frame.index else ""
+        query_title = self._normalize_title(query_name)
+        query_tokens = set(query_title.split())
+        scores = np.zeros(len(item_frame), dtype=np.float32)
+
+        if not query_title:
+            return scores
+
+        for idx, candidate_name in enumerate(item_frame.get("name", pd.Series("", index=item_frame.index))):
+            candidate_title = self._normalize_title(candidate_name)
+            if not candidate_title:
+                continue
+
+            candidate_tokens = set(candidate_title.split())
+            token_score = (
+                len(query_tokens & candidate_tokens) / len(query_tokens | candidate_tokens)
+                if query_tokens and candidate_tokens
+                else 0.0
+            )
+            sequence_score = SequenceMatcher(None, query_title, candidate_title).ratio()
+
+            if candidate_title == query_title:
+                score = 1.0
+            elif candidate_title.startswith(f"{query_title} ") or query_title.startswith(f"{candidate_title} "):
+                score = 0.95
+            elif query_title in candidate_title or candidate_title in query_title:
+                score = 0.9
+            else:
+                score = max(token_score, sequence_score * 0.75)
+
+            scores[idx] = float(score)
+
+        scores[self.item_to_idx[anime_id]] = -np.inf
+        return scores
+
     def _top_indices(self, scores: np.ndarray, top_k: int) -> np.ndarray:
         if top_k >= len(scores):
             return np.argsort(-scores)
@@ -261,17 +316,22 @@ class ExplicitALSRecommender:
         anime_df: pd.DataFrame,
         top_k: int = 5,
         content_weight: float = 0.5,
+        title_weight: float = 0.55,
     ) -> pd.DataFrame:
         if self.item_ids is None:
             raise ValueError("Model has not been fit yet.")
 
         content_weight = float(np.clip(content_weight, 0.0, 1.0))
-        als_weight = 1.0 - content_weight
+        title_weight = float(np.clip(title_weight, 0.0, 1.0))
+        base_weight = 1.0 - title_weight
+        als_weight = base_weight * (1.0 - content_weight)
+        content_weight = base_weight * content_weight
 
         anime_lookup = self._prepare_anime_lookup(anime_df)
         als_scores = self._als_similarity_scores(anime_id)
         content_scores = self._content_similarity_scores(anime_id, anime_df)
-        hybrid_scores = als_weight * als_scores + content_weight * content_scores
+        title_scores = self._title_similarity_scores(anime_id, anime_df)
+        hybrid_scores = als_weight * als_scores + content_weight * content_scores + title_weight * title_scores
         hybrid_scores[self.item_to_idx[anime_id]] = -np.inf
 
         top_indices = self._top_indices(hybrid_scores, top_k)
@@ -281,6 +341,7 @@ class ExplicitALSRecommender:
                 "hybrid_score": hybrid_scores[top_indices],
                 "als_similarity": als_scores[top_indices],
                 "content_similarity": content_scores[top_indices],
+                "title_similarity": title_scores[top_indices],
             }
         )
         result = result.join(anime_lookup[["name", "genre", "type"]], on="anime_id")
