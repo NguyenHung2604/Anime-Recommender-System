@@ -1,0 +1,15 @@
+# Data Manipulation
+pandas
+numpy
+
+# Visualization
+matplotlib
+seaborn
+
+# Machine Learning & Similarity
+scikit-learn
+scipy
+optuna
+
+# App UI
+streamlit
