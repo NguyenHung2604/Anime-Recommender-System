@@ -12,6 +12,7 @@ import pandas as pd
 from scipy.sparse import csr_matrix, hstack
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
+from sklearn.model_selection import train_test_split
 
 
 @dataclass
@@ -236,6 +237,50 @@ class ExplicitALSRecommender:
         top_indices = np.argpartition(-scores, top_k)[:top_k]
         return top_indices[np.argsort(-scores[top_indices])]
 
+    def evaluate(self, test_ratings: pd.DataFrame) -> dict[str, float]:
+        """
+        Evaluate model on test ratings using RMSE and MAE.
+        """
+        required_columns = {"user_id", "anime_id", "rating"}
+        missing_columns = required_columns - set(test_ratings.columns)
+        if missing_columns:
+            raise ValueError(f"Missing required columns: {sorted(missing_columns)}")
+
+        data = test_ratings[["user_id", "anime_id", "rating"]].copy()
+        data["rating"] = pd.to_numeric(data["rating"], errors="coerce")
+        data = data.dropna(subset=["user_id", "anime_id", "rating"])
+        data = data[data["rating"] > 0].copy()
+
+        if data.empty:
+            raise ValueError("No valid positive ratings found for evaluation.")
+
+        y_true = []
+        y_pred = []
+
+        for row in data.itertuples(index=False):
+            user_id = int(row.user_id)
+            anime_id = int(row.anime_id)
+            true_rating = float(row.rating)
+
+            predicted_rating = self.predict(user_id, anime_id)
+
+            y_true.append(true_rating)
+            y_pred.append(predicted_rating)
+
+        y_true = np.array(y_true, dtype=np.float32)
+        y_pred = np.array(y_pred, dtype=np.float32)
+
+        errors = y_true - y_pred
+
+        rmse = float(np.sqrt(np.mean(errors ** 2)))
+        mae = float(np.mean(np.abs(errors)))
+
+        return {
+            "rmse": rmse,
+            "mae": mae,
+            "n_test": int(len(y_true)),
+        }
+
     def similar_anime(
         self,
         anime_id: int,
@@ -385,14 +430,27 @@ class ExplicitALSRecommender:
         return model
 
 
-def load_data(ratings_path: str | Path, anime_path: str | Path, max_rows: int | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_data(
+    ratings_path: str | Path,
+    anime_path: str | Path,
+    test_size: float = 0.2,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     ratings = pd.read_csv(ratings_path)
     anime = pd.read_csv(anime_path)
 
-    if max_rows is not None and max_rows > 0:
-        ratings = ratings.head(max_rows).copy()
+    ratings["rating"] = pd.to_numeric(ratings["rating"], errors="coerce")
+    ratings = ratings.dropna(subset=["user_id", "anime_id", "rating"])
+    ratings = ratings[ratings["rating"] > 0].copy()
 
-    return ratings, anime
+    train_ratings, test_ratings = train_test_split(
+        ratings,
+        test_size=test_size,
+        random_state=random_state,
+        shuffle=True,
+    )
+
+    return train_ratings, test_ratings, anime
 
 
 
@@ -415,9 +473,9 @@ def main() -> None:
     )
     parser.add_argument("--n-factors", type=int, default=32)
     parser.add_argument("--n-iters", type=int, default=15)
-    parser.add_argument("--reg", type=float, default=0.1)
+    parser.add_argument("--reg", type=float, default=0.5)
     parser.add_argument("--random-state", type=int, default=42)
-    parser.add_argument("--max-rows", type=int, default=50000, help="Use a small subset for a quick test.")
+    parser.add_argument("--test-size", type=float, default=0.01)
     parser.add_argument("--user-id", type=int, default=1, help="User id to print recommendations for.")
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--anime-id", type=int, default=None, help="Anime id to find similar titles for.")
@@ -438,7 +496,12 @@ def main() -> None:
     parser.add_argument("--save-dir", type=str, default="artifacts/als_model")
     args = parser.parse_args()
 
-    ratings_df, anime_df = load_data(args.ratings, args.anime, max_rows=args.max_rows)
+    train_df, test_df, anime_df = load_data(
+    args.ratings,
+    args.anime,
+    test_size=args.test_size,
+    random_state=args.random_state,
+    )
 
     config = ALSConfig(
         n_factors=args.n_factors,
@@ -447,7 +510,15 @@ def main() -> None:
         random_state=args.random_state,
     )
     model = ExplicitALSRecommender(config)
-    model.fit(ratings_df)
+    model.fit(train_df)
+
+    metrics = model.evaluate(test_df)
+
+    print("Evaluation on test set:")
+    print(f"RMSE: {metrics['rmse']:.4f}")
+    print(f"MAE : {metrics['mae']:.4f}")
+    print(f"Test samples: {metrics['n_test']}")
+    print()
 
     if args.anime_id is not None or args.anime_name is not None:
         if args.anime_id is not None:
