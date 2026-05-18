@@ -834,7 +834,14 @@ def main() -> None:
     parser.add_argument(
         "--tune",
         action="store_true",
-        help="Try multiple ALS hyperparameter values and keep the model with the lowest dev RMSE.",
+        default=True,
+        help="Try multiple ALS hyperparameter values and keep the model with the lowest dev RMSE. Enabled by default.",
+    )
+    parser.add_argument(
+        "--no-tune",
+        action="store_false",
+        dest="tune",
+        help="Disable default tuning and train one model with --n-factors, --n-iters, and --reg.",
     )
     parser.add_argument(
         "--n-factors-grid",
@@ -862,8 +869,8 @@ def main() -> None:
     parser.add_argument(
         "--test-size",
         type=float,
-        default=0.1,
-        help="Fraction of each user's ratings held out as a test set when --evaluate is used.",
+        default=0.05,
+        help="Fraction of each user's ratings held out as a test set when --evaluate or --tune is used.",
     )
     parser.add_argument(
         "--dev-size",
