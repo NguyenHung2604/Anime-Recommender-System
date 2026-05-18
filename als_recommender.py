@@ -690,6 +690,102 @@ def evaluate_als_model(
     return model, metrics, train_ratings, dev_ratings, test_ratings
 
 
+def parse_int_grid(value: str) -> list[int]:
+    values = [int(part.strip()) for part in value.split(",") if part.strip()]
+    if not values:
+        raise ValueError("Grid must contain at least one integer value.")
+    if any(item <= 0 for item in values):
+        raise ValueError("Grid values must be positive integers.")
+    return values
+
+
+def parse_float_grid(value: str) -> list[float]:
+    values = [float(part.strip()) for part in value.split(",") if part.strip()]
+    if not values:
+        raise ValueError("Grid must contain at least one float value.")
+    if any(item <= 0 for item in values):
+        raise ValueError("Grid values must be positive floats.")
+    return values
+
+
+def tune_als_model(
+    ratings: pd.DataFrame,
+    n_factors_grid: list[int],
+    n_iters_grid: list[int],
+    reg_grid: list[float],
+    dev_size: float = 0.05,
+    test_size: float = 0.1,
+    random_state: int = 42,
+) -> tuple[
+    ExplicitALSRecommender,
+    dict[str, dict[str, float | int] | list[dict[str, float | int]]],
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+]:
+    train_ratings, dev_ratings, test_ratings = train_dev_test_split_by_user(
+        ratings,
+        dev_size=dev_size,
+        test_size=test_size,
+        random_state=random_state,
+    )
+    if dev_ratings.empty:
+        raise ValueError("Tuning requires a non-empty dev split. Use --dev-size greater than 0.")
+
+    best_model: ExplicitALSRecommender | None = None
+    best_dev_metrics: dict[str, float | int] | None = None
+    best_config: ALSConfig | None = None
+    tuning_results: list[dict[str, float | int]] = []
+
+    for n_factors in n_factors_grid:
+        for n_iters in n_iters_grid:
+            for reg in reg_grid:
+                candidate_config = ALSConfig(
+                    n_factors=n_factors,
+                    n_iters=n_iters,
+                    reg=reg,
+                    random_state=random_state,
+                )
+                candidate_model = ExplicitALSRecommender(candidate_config)
+                candidate_model.fit(train_ratings)
+                dev_metrics = candidate_model.evaluate(dev_ratings)
+                result = {
+                    "n_factors": int(n_factors),
+                    "n_iters": int(n_iters),
+                    "reg": float(reg),
+                    "dev_rmse": float(dev_metrics["rmse"]),
+                    "dev_mae": float(dev_metrics["mae"]),
+                    "dev_coverage": float(dev_metrics["coverage"]),
+                }
+                tuning_results.append(result)
+                print(
+                    "tune "
+                    f"n_factors={n_factors}, n_iters={n_iters}, reg={reg:.4f} "
+                    f"=> dev RMSE={dev_metrics['rmse']:.4f}, MAE={dev_metrics['mae']:.4f}"
+                )
+
+                if best_dev_metrics is None or dev_metrics["rmse"] < best_dev_metrics["rmse"]:
+                    best_model = candidate_model
+                    best_dev_metrics = dev_metrics
+                    best_config = candidate_config
+
+    if best_model is None or best_dev_metrics is None or best_config is None:
+        raise ValueError("No ALS tuning candidates were evaluated.")
+
+    metrics: dict[str, dict[str, float | int] | list[dict[str, float | int]]] = {
+        "dev": best_dev_metrics,
+        "test": best_model.evaluate(test_ratings),
+        "split": {
+            "n_train": int(len(train_ratings)),
+            "n_dev": int(len(dev_ratings)),
+            "n_test": int(len(test_ratings)),
+        },
+        "best_config": asdict(best_config),
+        "tuning_results": tuning_results,
+    }
+    return best_model, metrics, train_ratings, dev_ratings, test_ratings
+
+
 
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
@@ -712,7 +808,7 @@ def main() -> None:
     parser.add_argument("--n-iters", type=int, default=5)
     parser.add_argument("--reg", type=float, default=0.1)
     parser.add_argument("--random-state", type=int, default=42)
-    parser.add_argument("--max-rows", type=int, default=50000, help="Use a small subset for a quick test.")
+    parser.add_argument("--max-rows", type=int, default=None, help="Maximum rating rows to load. Default uses all rows.")
     parser.add_argument("--user-id", type=int, default=1, help="User id to print recommendations for.")
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--anime-id", type=int, default=None, help="Anime id to find similar titles for.")
@@ -734,6 +830,29 @@ def main() -> None:
         "--evaluate",
         action="store_true",
         help="Evaluate ALS with a per-user train/test split before printing recommendations.",
+    )
+    parser.add_argument(
+        "--tune",
+        action="store_true",
+        help="Try multiple ALS hyperparameter values and keep the model with the lowest dev RMSE.",
+    )
+    parser.add_argument(
+        "--n-factors-grid",
+        type=str,
+        default="16,32,64",
+        help="Comma-separated ALS factor values used by --tune.",
+    )
+    parser.add_argument(
+        "--n-iters-grid",
+        type=str,
+        default="5,8,10",
+        help="Comma-separated ALS iteration values used by --tune.",
+    )
+    parser.add_argument(
+        "--reg-grid",
+        type=str,
+        default="0.05,0.1,0.2",
+        help="Comma-separated regularization values used by --tune.",
     )
     parser.add_argument(
         "--show-after-evaluate",
@@ -775,7 +894,57 @@ def main() -> None:
         reg=args.reg,
         random_state=args.random_state,
     )
-    if args.evaluate:
+    if args.tune:
+        n_factors_grid = parse_int_grid(args.n_factors_grid)
+        n_iters_grid = parse_int_grid(args.n_iters_grid)
+        reg_grid = parse_float_grid(args.reg_grid)
+        print("Tuning ALS hyperparameters")
+        print(f"n_factors grid: {n_factors_grid}")
+        print(f"n_iters grid: {n_iters_grid}")
+        print(f"reg grid: {reg_grid}")
+        print()
+
+        model, metrics, _, _, _ = tune_als_model(
+            ratings_df,
+            n_factors_grid=n_factors_grid,
+            n_iters_grid=n_iters_grid,
+            reg_grid=reg_grid,
+            dev_size=args.dev_size,
+            test_size=args.test_size,
+            random_state=args.random_state,
+        )
+        best_config = metrics["best_config"]
+        print("\nBest ALS config")
+        print(
+            f"n_factors={best_config['n_factors']}, "
+            f"n_iters={best_config['n_iters']}, "
+            f"reg={best_config['reg']}"
+        )
+
+        print("\nDev metrics")
+        dev_metrics = metrics["dev"]
+        print(f"known user/item coverage: {dev_metrics['coverage']:.3f}")
+        print(f"RMSE: {dev_metrics['rmse']:.4f}  | baseline RMSE: {dev_metrics['baseline_rmse']:.4f}")
+        print(f"MAE : {dev_metrics['mae']:.4f}  | baseline MAE : {dev_metrics['baseline_mae']:.4f}")
+
+        test_metrics = metrics["test"]
+        print("\nTest metrics")
+        print(f"known user/item coverage: {test_metrics['coverage']:.3f}")
+        print(f"RMSE: {test_metrics['rmse']:.4f}  | baseline RMSE: {test_metrics['baseline_rmse']:.4f}")
+        print(f"MAE : {test_metrics['mae']:.4f}  | baseline MAE : {test_metrics['baseline_mae']:.4f}")
+        print()
+        split_metadata = {
+            "trained_on": "train_split_only_tuned",
+            "split": metrics["split"],
+            "dev_size": args.dev_size,
+            "test_size": args.test_size,
+            "max_rows": args.max_rows,
+            "best_config": metrics["best_config"],
+            "dev_metrics": metrics["dev"],
+            "test_metrics": metrics["test"],
+            "tuning_results": metrics["tuning_results"],
+        }
+    elif args.evaluate:
         model, metrics, _, _, _ = evaluate_als_model(
             ratings_df,
             config=config,
@@ -814,8 +983,13 @@ def main() -> None:
     else:
         model = ExplicitALSRecommender(config)
         model.fit(ratings_df)
+        train_metrics = model.evaluate(ratings_df)
+        print("ALS RMSE on loaded ratings")
+        print(f"RMSE: {train_metrics['rmse']:.4f}  | baseline RMSE: {train_metrics['baseline_rmse']:.4f}")
+        print(f"MAE : {train_metrics['mae']:.4f}  | baseline MAE : {train_metrics['baseline_mae']:.4f}")
+        print()
 
-    should_show_output = (not args.evaluate) or args.show_after_evaluate
+    should_show_output = (not args.evaluate and not args.tune) or args.show_after_evaluate
     if should_show_output and (args.anime_id is not None or args.anime_name is not None):
         if args.anime_id is not None:
             query_anime_id = args.anime_id

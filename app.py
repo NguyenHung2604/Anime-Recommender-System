@@ -18,7 +18,7 @@ BASE_DIR = Path(__file__).resolve().parent
 RATINGS_PATH = BASE_DIR / "anime data" / "rating.csv"
 ANIME_PATH = BASE_DIR / "anime data" / "anime.csv"
 MODEL_DIR = BASE_DIR / "artifacts" / "als_model"
-MODEL_FILENAME = "als_model_2.pkl"
+MODEL_FILENAME = "als_model.pkl"
 
 
 st.set_page_config(page_title="Anime Hybrid Recommender", layout="wide")
