@@ -15,6 +15,7 @@ from als_recommender import ALSConfig, ExplicitALSRecommender
 
 import requests
 import urllib.parse
+import time
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -404,10 +405,11 @@ def recommend_for_new_viewer(
     result["matched_genres"] = ", ".join(target_genres) if target_genres else "All"
     return result.reset_index(drop=True), alpha, reason
 
-
+@st.cache_data(show_spinner=False)
 def get_poster_by_name(anime_name):
     """Tìm kiếm poster dựa trên tên anime qua Jikan API"""
     try:
+        time.sleep(0.35)
         # Mã hóa tên để tránh lỗi khi tên có khoảng trắng hoặc ký tự đặc biệt
         encoded_name = urllib.parse.quote(anime_name)
         url = f"https://api.jikan.moe/v4/anime?q={encoded_name}&limit=1"
@@ -443,8 +445,12 @@ def display_anime_cards(df, columns_per_row=5):
                 st.markdown(f"**{display_name[:40]}{'...' if len(display_name) > 40 else ''}**")
                 
                 # Hiển thị điểm số nếu có[cite: 1]
-                if 'hybrid_score' in row:
+                if 'hybrid_score' in row and pd.notna(row['hybrid_score']):
                     st.caption(f"Score: {row['hybrid_score']:.2f}")
+                elif 'content_similarity' in row and pd.notna(row['content_similarity']):
+                    st.caption(f"Content Sim: {row['content_similarity']:.2f}")
+                elif 'recommendation_score' in row and pd.notna(row['recommendation_score']):
+                    st.caption(f"Rec Score: {row['recommendation_score']:.2f}")
 
 def show_query_result(
     model: ExplicitALSRecommender,
@@ -464,23 +470,28 @@ def show_query_result(
             top_k=top_k,
         )
         st.success(f"Top {top_k} anime similar to: {query_name} (content-based)")
-        st.dataframe(
-            similar_df[
-                existing_columns(
-                    similar_df,
-                    [
-                        "anime_id",
-                        "name",
-                        "genre",
-                        "type",
-                        "content_similarity",
-                        "metadata_similarity",
-                        "title_similarity",
-                    ],
-                )
-            ],
-            use_container_width=True,
-        )
+
+        #hiển thị poster
+        display_anime_cards(similar_df, columns_per_row=5)
+
+        #dataframe để hiện kết quả dạng bảng chữ
+        #st.dataframe(
+        #    similar_df[
+        #        existing_columns(
+        #           similar_df,
+        #            [
+        #                "anime_id",
+        #                "name",
+        #                "genre",
+        #                "type",
+        #                "content_similarity",
+        #                "metadata_similarity",
+        #                "title_similarity",
+        #            ],
+        #        )
+        #    ],
+        #    use_container_width=True,
+        #)
         return
 
     similar_df = model.hybrid_similar_anime(
@@ -491,24 +502,29 @@ def show_query_result(
     )
     similar_df = add_title_similarity_if_missing(similar_df, anime_lookup, query_anime_id)
     st.success(f"Top {top_k} anime similar to: {query_name}")
-    st.dataframe(
-        similar_df[
-            existing_columns(
-                similar_df,
-                [
-                    "anime_id",
-                    "name",
-                    "genre",
-                    "type",
-                    "hybrid_score",
-                    "als_similarity",
-                    "content_similarity",
-                    "title_similarity",
-                ],
-            )
-        ],
-        use_container_width=True,
-    )
+
+    #hiển thị poster
+    display_anime_cards(similar_df, columns_per_row=5)
+        
+    #dataframe để hiện kết quả dạng bảng chữ
+    #st.dataframe(
+    #    similar_df[
+    #        existing_columns(
+    #            similar_df,
+    #           [
+    #                "anime_id",
+    #                "name",
+    #                "genre",
+    #                "type",
+    #                "hybrid_score",
+    #                "als_similarity",
+    #                "content_similarity",
+    #                "title_similarity",
+    #            ],
+    #        )
+    #    ],
+    #    use_container_width=True,
+    #)
 
 
 def show_new_viewer_recommendations(
