@@ -1,7 +1,10 @@
 {
-  "n_users": 495,
-  "n_items": 3800,
-  "n_factors": 32,
-  "n_iters": 15,
-  "reg": 0.1
+  "n_users": 69600,
+  "n_items": 9927,
+  "n_factors": 16,
+  "n_iters": 5,
+  "reg": 0.1,
+  "model_filename": "als_model.pkl",
+  "trained_on": "all_loaded_ratings",
+  "max_rows": null
 }
