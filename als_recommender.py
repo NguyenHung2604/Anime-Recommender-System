@@ -6,8 +6,7 @@ import json
 import pickle
 import re
 import sys
-from dataclasses import dataclass
-from difflib import SequenceMatcher
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -19,8 +18,8 @@ from sklearn.preprocessing import normalize
 
 @dataclass
 class ALSConfig:
-    n_factors: int = 32
-    n_iters: int = 15
+    n_factors: int = 16
+    n_iters: int = 5
     reg: float = 0.1
     random_state: int = 42
 
@@ -141,6 +140,39 @@ class ExplicitALSRecommender:
         score = float(self.global_mean + self.user_factors[user_idx] @ self.item_factors[item_idx])
         return float(np.clip(score, 1.0, 10.0))
 
+    def evaluate(self, ratings: pd.DataFrame) -> dict[str, float | int]:
+        if self.user_factors is None or self.item_factors is None:
+            raise ValueError("Model has not been fit yet.")
+
+        test_data = clean_explicit_ratings(ratings)
+        if test_data.empty:
+            raise ValueError("No positive ratings found for evaluation.")
+
+        predictions = np.array(
+            [
+                self.predict(int(row.user_id), int(row.anime_id))
+                for row in test_data.itertuples(index=False)
+            ],
+            dtype=np.float32,
+        )
+        actual = test_data["rating"].to_numpy(dtype=np.float32)
+        errors = predictions - actual
+
+        known_mask = (
+            test_data["user_id"].isin(self.user_to_idx)
+            & test_data["anime_id"].isin(self.item_to_idx)
+        )
+        baseline_errors = np.full(len(actual), self.global_mean, dtype=np.float32) - actual
+
+        return {
+            "n_test": int(len(test_data)),
+            "coverage": float(known_mask.mean()),
+            "rmse": float(np.sqrt(np.mean(errors**2))),
+            "mae": float(np.mean(np.abs(errors))),
+            "baseline_rmse": float(np.sqrt(np.mean(baseline_errors**2))),
+            "baseline_mae": float(np.mean(np.abs(baseline_errors))),
+        }
+
     def _prepare_anime_lookup(self, anime_df: pd.DataFrame) -> pd.DataFrame:
         anime_lookup = anime_df.copy()
         anime_lookup["anime_id"] = pd.to_numeric(anime_lookup["anime_id"], errors="coerce")
@@ -241,6 +273,53 @@ class ExplicitALSRecommender:
         text = re.sub(r"[^a-z0-9]+", " ", text)
         return re.sub(r"\s+", " ", text).strip()
 
+    def _shared_prefix_ratio(self, query_title: str, candidate_title: str) -> float:
+        query_tokens = query_title.split()
+        candidate_tokens = candidate_title.split()
+        if not query_tokens or not candidate_tokens:
+            return 0.0
+
+        prefix_len = 0
+        for query_token, candidate_token in zip(query_tokens, candidate_tokens):
+            if query_token != candidate_token:
+                break
+            prefix_len += 1
+
+        min_len = min(len(query_tokens), len(candidate_tokens))
+        if prefix_len < min(2, min_len):
+            return 0.0
+
+        return prefix_len / max(len(query_tokens), len(candidate_tokens))
+
+    def _title_similarity_score_pair(self, query_title: str, candidate_title: str) -> float:
+        if not query_title or not candidate_title:
+            return 0.0
+
+        if candidate_title == query_title:
+            return 1.0
+        if candidate_title.startswith(f"{query_title} ") or query_title.startswith(f"{candidate_title} "):
+            return 0.95
+
+        shared_prefix_score = self._shared_prefix_ratio(query_title, candidate_title)
+        if shared_prefix_score > 0:
+            return 0.85 + 0.1 * shared_prefix_score
+
+        shorter_token_count = min(len(query_title.split()), len(candidate_title.split()))
+        if shorter_token_count >= 2 and (
+            f" {query_title} " in f" {candidate_title} "
+            or f" {candidate_title} " in f" {query_title} "
+        ):
+            return 0.9
+
+        query_tokens = set(query_title.split())
+        candidate_tokens = set(candidate_title.split())
+        token_score = (
+            len(query_tokens & candidate_tokens) / len(query_tokens | candidate_tokens)
+            if query_tokens and candidate_tokens
+            else 0.0
+        )
+        return float(token_score if token_score >= 0.5 else 0.0)
+
     def _title_similarity_scores(self, anime_id: int, anime_df: pd.DataFrame) -> np.ndarray:
         if self.item_ids is None:
             raise ValueError("Model has not been fit yet.")
@@ -251,7 +330,6 @@ class ExplicitALSRecommender:
         item_frame = anime_lookup.reindex(self.item_ids)
         query_name = item_frame.loc[anime_id, "name"] if anime_id in item_frame.index else ""
         query_title = self._normalize_title(query_name)
-        query_tokens = set(query_title.split())
         scores = np.zeros(len(item_frame), dtype=np.float32)
 
         if not query_title:
@@ -262,27 +340,52 @@ class ExplicitALSRecommender:
             if not candidate_title:
                 continue
 
-            candidate_tokens = set(candidate_title.split())
-            token_score = (
-                len(query_tokens & candidate_tokens) / len(query_tokens | candidate_tokens)
-                if query_tokens and candidate_tokens
-                else 0.0
-            )
-            sequence_score = SequenceMatcher(None, query_title, candidate_title).ratio()
-
-            if candidate_title == query_title:
-                score = 1.0
-            elif candidate_title.startswith(f"{query_title} ") or query_title.startswith(f"{candidate_title} "):
-                score = 0.95
-            elif query_title in candidate_title or candidate_title in query_title:
-                score = 0.9
-            else:
-                score = max(token_score, sequence_score * 0.75)
-
-            scores[idx] = float(score)
+            scores[idx] = self._title_similarity_score_pair(query_title, candidate_title)
 
         scores[self.item_to_idx[anime_id]] = -np.inf
         return scores
+
+    def _metadata_title_candidates(
+        self,
+        anime_id: int,
+        anime_df: pd.DataFrame,
+        min_title_score: float = 0.85,
+    ) -> pd.DataFrame:
+        if self.item_ids is None:
+            raise ValueError("Model has not been fit yet.")
+
+        anime_lookup = self._prepare_anime_lookup(anime_df)
+        if anime_id not in anime_lookup.index:
+            return pd.DataFrame()
+
+        query_title = self._normalize_title(anime_lookup.loc[anime_id, "name"])
+        trained_ids = set(int(item_id) for item_id in self.item_ids.tolist())
+        rows = []
+
+        for candidate_id, candidate_row in anime_lookup.iterrows():
+            candidate_id = int(candidate_id)
+            if candidate_id == anime_id or candidate_id in trained_ids:
+                continue
+
+            candidate_title = self._normalize_title(candidate_row.get("name", ""))
+            title_score = self._title_similarity_score_pair(query_title, candidate_title)
+            if title_score < min_title_score:
+                continue
+
+            rows.append(
+                {
+                    "anime_id": candidate_id,
+                    "hybrid_score": title_score,
+                    "als_similarity": np.nan,
+                    "content_similarity": np.nan,
+                    "title_similarity": title_score,
+                    "name": candidate_row.get("name"),
+                    "genre": candidate_row.get("genre"),
+                    "type": candidate_row.get("type"),
+                }
+            )
+
+        return pd.DataFrame(rows)
 
     def _top_indices(self, scores: np.ndarray, top_k: int) -> np.ndarray:
         if top_k >= len(scores):
@@ -316,7 +419,7 @@ class ExplicitALSRecommender:
         anime_df: pd.DataFrame,
         top_k: int = 5,
         content_weight: float = 0.5,
-        title_weight: float = 0.55,
+        title_weight: float = 0.45,
     ) -> pd.DataFrame:
         if self.item_ids is None:
             raise ValueError("Model has not been fit yet.")
@@ -345,6 +448,11 @@ class ExplicitALSRecommender:
             }
         )
         result = result.join(anime_lookup[["name", "genre", "type"]], on="anime_id")
+        metadata_title_candidates = self._metadata_title_candidates(anime_id, anime_df)
+        if not metadata_title_candidates.empty:
+            result = pd.concat([result.reset_index(drop=True), metadata_title_candidates], ignore_index=True)
+            result = result.sort_values("hybrid_score", ascending=False).head(top_k)
+
         return result.reset_index(drop=True)
 
     def recommend(
@@ -392,14 +500,19 @@ class ExplicitALSRecommender:
         result = result.reset_index(drop=True)
         return result
 
-    def save(self, directory: str | Path) -> None:
+    def save(
+        self,
+        directory: str | Path,
+        model_filename: str = "als_model.pkl",
+        metadata_extra: dict[str, object] | None = None,
+    ) -> None:
         if self.user_factors is None or self.item_factors is None:
             raise ValueError("Model has not been fit yet.")
 
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         payload = {
-            "config": self.config,
+            "config": asdict(self.config),
             "global_mean": self.global_mean,
             "user_factors": self.user_factors,
             "item_factors": self.item_factors,
@@ -410,30 +523,37 @@ class ExplicitALSRecommender:
             "item_popularity": self.item_popularity,
             "ratings_by_user": self._ratings_by_user,
         }
-        with open(directory / "als_model.pkl", "wb") as handle:
+        with open(directory / model_filename, "wb") as handle:
             pickle.dump(payload, handle)
+
+        metadata = {
+            "n_users": int(len(self.user_ids) if self.user_ids is not None else 0),
+            "n_items": int(len(self.item_ids) if self.item_ids is not None else 0),
+            "n_factors": int(self.config.n_factors),
+            "n_iters": int(self.config.n_iters),
+            "reg": float(self.config.reg),
+            "model_filename": model_filename,
+        }
+        if metadata_extra:
+            metadata.update(metadata_extra)
 
         with open(directory / "als_metadata.json", "w", encoding="utf-8") as handle:
             json.dump(
-                {
-                    "n_users": int(len(self.user_ids) if self.user_ids is not None else 0),
-                    "n_items": int(len(self.item_ids) if self.item_ids is not None else 0),
-                    "n_factors": int(self.config.n_factors),
-                    "n_iters": int(self.config.n_iters),
-                    "reg": float(self.config.reg),
-                },
+                metadata,
                 handle,
                 ensure_ascii=False,
                 indent=2,
             )
 
     @classmethod
-    def load(cls, directory: str | Path) -> "ExplicitALSRecommender":
+    def load(cls, directory: str | Path, model_filename: str = "als_model.pkl") -> "ExplicitALSRecommender":
         directory = Path(directory)
-        with open(directory / "als_model.pkl", "rb") as handle:
+        with open(directory / model_filename, "rb") as handle:
             payload = pickle.load(handle)
 
-        model = cls(payload["config"])
+        config_payload = payload["config"]
+        config = ALSConfig(**config_payload) if isinstance(config_payload, dict) else config_payload
+        model = cls(config)
         model.global_mean = payload["global_mean"]
         model.user_factors = payload["user_factors"]
         model.item_factors = payload["item_factors"]
@@ -456,6 +576,120 @@ def load_data(ratings_path: str | Path, anime_path: str | Path, max_rows: int | 
     return ratings, anime
 
 
+def clean_explicit_ratings(ratings: pd.DataFrame) -> pd.DataFrame:
+    required_columns = {"user_id", "anime_id", "rating"}
+    missing_columns = required_columns - set(ratings.columns)
+    if missing_columns:
+        raise ValueError(f"Missing required columns: {sorted(missing_columns)}")
+
+    data = ratings[["user_id", "anime_id", "rating"]].copy()
+    data["user_id"] = pd.to_numeric(data["user_id"], errors="coerce")
+    data["anime_id"] = pd.to_numeric(data["anime_id"], errors="coerce")
+    data["rating"] = pd.to_numeric(data["rating"], errors="coerce")
+    data = data.dropna(subset=["user_id", "anime_id", "rating"])
+    data = data[data["rating"] > 0].copy()
+    data["user_id"] = data["user_id"].astype(np.int64)
+    data["anime_id"] = data["anime_id"].astype(np.int64)
+    data["rating"] = data["rating"].astype(np.float32)
+    return data
+
+
+def train_test_split_by_user(
+    ratings: pd.DataFrame,
+    test_size: float = 0.1,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    train, _, test = train_dev_test_split_by_user(
+        ratings,
+        dev_size=0.0,
+        test_size=test_size,
+        random_state=random_state,
+    )
+    return train, test
+
+
+def train_dev_test_split_by_user(
+    ratings: pd.DataFrame,
+    dev_size: float = 0.05,
+    test_size: float = 0.1,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    data = clean_explicit_ratings(ratings)
+    if data.empty:
+        raise ValueError("No positive ratings found after filtering rating > 0.")
+
+    rng = np.random.default_rng(random_state)
+    train_parts: list[pd.DataFrame] = []
+    dev_parts: list[pd.DataFrame] = []
+    test_parts: list[pd.DataFrame] = []
+    dev_size = float(np.clip(dev_size, 0.0, 0.8))
+    test_size = float(np.clip(test_size, 0.01, 0.9))
+    if dev_size + test_size >= 0.95:
+        raise ValueError("dev_size + test_size must be less than 0.95 so train data is not empty.")
+
+    for _, group in data.groupby("user_id", sort=False):
+        if len(group) < 2:
+            train_parts.append(group)
+            continue
+
+        n_test = int(round(len(group) * test_size))
+        n_test = min(max(n_test, 1), len(group) - 1)
+        test_index = rng.choice(group.index.to_numpy(), size=n_test, replace=False)
+        test_mask = group.index.isin(test_index)
+        test_parts.append(group.loc[test_mask])
+
+        remaining = group.loc[~test_mask]
+        if dev_size > 0 and len(remaining) >= 2:
+            n_dev = int(round(len(group) * dev_size))
+            n_dev = min(max(n_dev, 1), len(remaining) - 1)
+            dev_index = rng.choice(remaining.index.to_numpy(), size=n_dev, replace=False)
+            dev_mask = remaining.index.isin(dev_index)
+            dev_parts.append(remaining.loc[dev_mask])
+            train_parts.append(remaining.loc[~dev_mask])
+        else:
+            train_parts.append(remaining)
+
+    train = pd.concat(train_parts, ignore_index=True) if train_parts else data.iloc[0:0].copy()
+    dev = pd.concat(dev_parts, ignore_index=True) if dev_parts else data.iloc[0:0].copy()
+    test = pd.concat(test_parts, ignore_index=True) if test_parts else data.iloc[0:0].copy()
+    if test.empty:
+        raise ValueError("Not enough users with at least 2 ratings to create an evaluation split.")
+
+    return train, dev, test
+
+
+def evaluate_als_model(
+    ratings: pd.DataFrame,
+    config: ALSConfig | None = None,
+    dev_size: float = 0.05,
+    test_size: float = 0.1,
+    random_state: int = 42,
+) -> tuple[
+    ExplicitALSRecommender,
+    dict[str, dict[str, float | int]],
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+]:
+    train_ratings, dev_ratings, test_ratings = train_dev_test_split_by_user(
+        ratings,
+        dev_size=dev_size,
+        test_size=test_size,
+        random_state=random_state,
+    )
+    model = ExplicitALSRecommender(config)
+    model.fit(train_ratings)
+    metrics = {"test": model.evaluate(test_ratings)}
+    if not dev_ratings.empty:
+        metrics["dev"] = model.evaluate(dev_ratings)
+    metrics["split"] = {
+        "n_train": int(len(train_ratings)),
+        "n_dev": int(len(dev_ratings)),
+        "n_test": int(len(test_ratings)),
+    }
+    return model, metrics, train_ratings, dev_ratings, test_ratings
+
+
 
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
@@ -474,8 +708,8 @@ def main() -> None:
         default=str(Path("anime data") / "anime.csv"),
         help="Path to anime.csv",
     )
-    parser.add_argument("--n-factors", type=int, default=32)
-    parser.add_argument("--n-iters", type=int, default=15)
+    parser.add_argument("--n-factors", type=int, default=16)
+    parser.add_argument("--n-iters", type=int, default=5)
     parser.add_argument("--reg", type=float, default=0.1)
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--max-rows", type=int, default=50000, help="Use a small subset for a quick test.")
@@ -496,10 +730,44 @@ def main() -> None:
         default=0.5,
         help="Hybrid weight for content similarity. 0 means ALS only, 1 means content only.",
     )
+    parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        help="Evaluate ALS with a per-user train/test split before printing recommendations.",
+    )
+    parser.add_argument(
+        "--show-after-evaluate",
+        action="store_true",
+        help="After --evaluate, also print recommendations or similar anime output.",
+    )
+    parser.add_argument(
+        "--test-size",
+        type=float,
+        default=0.1,
+        help="Fraction of each user's ratings held out as a test set when --evaluate is used.",
+    )
+    parser.add_argument(
+        "--dev-size",
+        type=float,
+        default=0.05,
+        help="Fraction of each user's ratings held out as a dev set when --evaluate is used.",
+    )
+    parser.add_argument(
+        "--title-weight",
+        type=float,
+        default=0.45,
+        help="Hybrid weight for strict title/franchise similarity.",
+    )
+    parser.add_argument("--no-save", action="store_true", help="Do not save the trained model artifacts.")
     parser.add_argument("--save-dir", type=str, default="artifacts/als_model")
+    parser.add_argument("--model-filename", type=str, default="als_model.pkl")
     args = parser.parse_args()
 
     ratings_df, anime_df = load_data(args.ratings, args.anime, max_rows=args.max_rows)
+    split_metadata: dict[str, object] = {
+        "trained_on": "all_loaded_ratings",
+        "max_rows": args.max_rows,
+    }
 
     config = ALSConfig(
         n_factors=args.n_factors,
@@ -507,10 +775,48 @@ def main() -> None:
         reg=args.reg,
         random_state=args.random_state,
     )
-    model = ExplicitALSRecommender(config)
-    model.fit(ratings_df)
+    if args.evaluate:
+        model, metrics, _, _, _ = evaluate_als_model(
+            ratings_df,
+            config=config,
+            dev_size=args.dev_size,
+            test_size=args.test_size,
+            random_state=args.random_state,
+        )
+        print("ALS evaluation on held-out ratings")
+        print(f"train rows: {metrics['split']['n_train']}")
+        if metrics["split"]["n_dev"]:
+            print(f"dev rows: {metrics['split']['n_dev']}")
+        print(f"test rows: {metrics['split']['n_test']}")
 
-    if args.anime_id is not None or args.anime_name is not None:
+        if "dev" in metrics:
+            dev_metrics = metrics["dev"]
+            print("\nDev metrics")
+            print(f"known user/item coverage: {dev_metrics['coverage']:.3f}")
+            print(f"RMSE: {dev_metrics['rmse']:.4f}  | baseline RMSE: {dev_metrics['baseline_rmse']:.4f}")
+            print(f"MAE : {dev_metrics['mae']:.4f}  | baseline MAE : {dev_metrics['baseline_mae']:.4f}")
+
+        test_metrics = metrics["test"]
+        print("\nTest metrics")
+        print(f"known user/item coverage: {test_metrics['coverage']:.3f}")
+        print(f"RMSE: {test_metrics['rmse']:.4f}  | baseline RMSE: {test_metrics['baseline_rmse']:.4f}")
+        print(f"MAE : {test_metrics['mae']:.4f}  | baseline MAE : {test_metrics['baseline_mae']:.4f}")
+        print()
+        split_metadata = {
+            "trained_on": "train_split_only",
+            "split": metrics["split"],
+            "dev_size": args.dev_size,
+            "test_size": args.test_size,
+            "max_rows": args.max_rows,
+            "dev_metrics": metrics.get("dev"),
+            "test_metrics": metrics["test"],
+        }
+    else:
+        model = ExplicitALSRecommender(config)
+        model.fit(ratings_df)
+
+    should_show_output = (not args.evaluate) or args.show_after_evaluate
+    if should_show_output and (args.anime_id is not None or args.anime_name is not None):
         if args.anime_id is not None:
             query_anime_id = args.anime_id
         else:
@@ -522,6 +828,7 @@ def main() -> None:
                 anime_df,
                 top_k=args.top_k,
                 content_weight=args.content_weight,
+                title_weight=args.title_weight,
             )
         else:
             similar_titles = model.similar_anime(query_anime_id, anime_df, top_k=args.top_k)
@@ -531,13 +838,14 @@ def main() -> None:
         print(f"Top {args.top_k} similar anime for: {query_name} (anime_id={query_anime_id})")
         print(f"mode={args.mode}, content_weight={args.content_weight:.2f}")
         print(similar_titles.to_string(index=False))
-    else:
+    elif should_show_output:
         recommendations = model.recommend(args.user_id, anime_df, top_k=args.top_k)
         print(f"Top {args.top_k} recommendations for user {args.user_id}:")
         print(recommendations.to_string(index=False))
 
-    model.save(args.save_dir)
-    print(f"\nModel saved to: {Path(args.save_dir) / 'als_model.pkl'}")
+    if not args.no_save:
+        model.save(args.save_dir, model_filename=args.model_filename, metadata_extra=split_metadata)
+        print(f"\nModel saved to: {Path(args.save_dir) / args.model_filename}")
 
 
 if __name__ == "__main__":
