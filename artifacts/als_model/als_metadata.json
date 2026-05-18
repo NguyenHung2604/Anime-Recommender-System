@@ -1,10 +1,257 @@
 {
   "n_users": 69600,
-  "n_items": 9927,
+  "n_items": 9831,
   "n_factors": 16,
-  "n_iters": 5,
-  "reg": 0.1,
+  "n_iters": 8,
+  "reg": 0.2,
   "model_filename": "als_model.pkl",
-  "trained_on": "all_loaded_ratings",
-  "max_rows": null
+  "trained_on": "train_split_only_tuned",
+  "split": {
+    "n_train": 5685222,
+    "n_dev": 324962,
+    "n_test": 327057
+  },
+  "dev_size": 0.05,
+  "test_size": 0.05,
+  "max_rows": null,
+  "best_config": {
+    "n_factors": 16,
+    "n_iters": 8,
+    "reg": 0.2,
+    "random_state": 42
+  },
+  "dev_metrics": {
+    "n_test": 324962,
+    "coverage": 0.9998522904216492,
+    "rmse": 1.1830111742019653,
+    "mae": 0.873244047164917,
+    "baseline_rmse": 1.5727698802947998,
+    "baseline_mae": 1.2370933294296265
+  },
+  "test_metrics": {
+    "n_test": 327057,
+    "coverage": 0.9998257184527468,
+    "rmse": 1.1831785440444946,
+    "mae": 0.8730108737945557,
+    "baseline_rmse": 1.5733261108398438,
+    "baseline_mae": 1.2367851734161377
+  },
+  "tuning_results": [
+    {
+      "n_factors": 16,
+      "n_iters": 5,
+      "reg": 0.05,
+      "dev_rmse": 1.1879185438156128,
+      "dev_mae": 0.8789556622505188,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 16,
+      "n_iters": 5,
+      "reg": 0.1,
+      "dev_rmse": 1.186819076538086,
+      "dev_mae": 0.878069281578064,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 16,
+      "n_iters": 5,
+      "reg": 0.2,
+      "dev_rmse": 1.1853055953979492,
+      "dev_mae": 0.877140462398529,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 16,
+      "n_iters": 8,
+      "reg": 0.05,
+      "dev_rmse": 1.186957597732544,
+      "dev_mae": 0.8755995035171509,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 16,
+      "n_iters": 8,
+      "reg": 0.1,
+      "dev_rmse": 1.1853939294815063,
+      "dev_mae": 0.874567449092865,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 16,
+      "n_iters": 8,
+      "reg": 0.2,
+      "dev_rmse": 1.1830111742019653,
+      "dev_mae": 0.873244047164917,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 16,
+      "n_iters": 10,
+      "reg": 0.05,
+      "dev_rmse": 1.188386082649231,
+      "dev_mae": 0.8755205273628235,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 16,
+      "n_iters": 10,
+      "reg": 0.1,
+      "dev_rmse": 1.1862126588821411,
+      "dev_mae": 0.8743124008178711,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 16,
+      "n_iters": 10,
+      "reg": 0.2,
+      "dev_rmse": 1.1835718154907227,
+      "dev_mae": 0.872857928276062,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 32,
+      "n_iters": 5,
+      "reg": 0.05,
+      "dev_rmse": 1.2535827159881592,
+      "dev_mae": 0.9202005863189697,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 32,
+      "n_iters": 5,
+      "reg": 0.1,
+      "dev_rmse": 1.2530947923660278,
+      "dev_mae": 0.919406533241272,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 32,
+      "n_iters": 5,
+      "reg": 0.2,
+      "dev_rmse": 1.252244234085083,
+      "dev_mae": 0.9187480211257935,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 32,
+      "n_iters": 8,
+      "reg": 0.05,
+      "dev_rmse": 1.2658817768096924,
+      "dev_mae": 0.9234658479690552,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 32,
+      "n_iters": 8,
+      "reg": 0.1,
+      "dev_rmse": 1.2628825902938843,
+      "dev_mae": 0.9219836592674255,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 32,
+      "n_iters": 8,
+      "reg": 0.2,
+      "dev_rmse": 1.258683443069458,
+      "dev_mae": 0.9195950031280518,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 32,
+      "n_iters": 10,
+      "reg": 0.05,
+      "dev_rmse": 1.272857427597046,
+      "dev_mae": 0.9260319471359253,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 32,
+      "n_iters": 10,
+      "reg": 0.1,
+      "dev_rmse": 1.269312858581543,
+      "dev_mae": 0.9245061874389648,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 32,
+      "n_iters": 10,
+      "reg": 0.2,
+      "dev_rmse": 1.2635308504104614,
+      "dev_mae": 0.9214379191398621,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 64,
+      "n_iters": 5,
+      "reg": 0.05,
+      "dev_rmse": 1.3488422632217407,
+      "dev_mae": 0.9888834953308105,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 64,
+      "n_iters": 5,
+      "reg": 0.1,
+      "dev_rmse": 1.3495147228240967,
+      "dev_mae": 0.988701581954956,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 64,
+      "n_iters": 5,
+      "reg": 0.2,
+      "dev_rmse": 1.3501996994018555,
+      "dev_mae": 0.989069402217865,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 64,
+      "n_iters": 8,
+      "reg": 0.05,
+      "dev_rmse": 1.3793582916259766,
+      "dev_mae": 1.0056524276733398,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 64,
+      "n_iters": 8,
+      "reg": 0.1,
+      "dev_rmse": 1.3775849342346191,
+      "dev_mae": 1.0044223070144653,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 64,
+      "n_iters": 8,
+      "reg": 0.2,
+      "dev_rmse": 1.3734707832336426,
+      "dev_mae": 1.002184510231018,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 64,
+      "n_iters": 10,
+      "reg": 0.05,
+      "dev_rmse": 1.3958606719970703,
+      "dev_mae": 1.015097737312317,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 64,
+      "n_iters": 10,
+      "reg": 0.1,
+      "dev_rmse": 1.3929815292358398,
+      "dev_mae": 1.0135021209716797,
+      "dev_coverage": 0.9998522904216492
+    },
+    {
+      "n_factors": 64,
+      "n_iters": 10,
+      "reg": 0.2,
+      "dev_rmse": 1.3864281177520752,
+      "dev_mae": 1.0099537372589111,
+      "dev_coverage": 0.9998522904216492
+    }
+  ]
 }
