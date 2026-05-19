@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import re
+import time
 
 import numpy as np
 import pandas as pd
@@ -37,7 +38,7 @@ RECOMMENDER_VERSION = "strict_title_similarity_v3"
 DEFAULT_TOP_K = 5
 DEFAULT_CONTENT_WEIGHT = 0.4
 DEFAULT_TITLE_WEIGHT = 0.3
-POSTER_CACHE_VERSION = "v2_no_proxy"
+POSTER_CACHE_VERSION = "v4_retry_no_failed_cache"
 
 
 def clean_anime_name(name: object) -> str:
@@ -323,7 +324,7 @@ def content_similar_anime(
 MOOD_GENRE_MAP = {
     "Không chọn": [],
     "Nhẹ nhàng": ["Comedy", "Slice of Life", "Romance"],
-    "Hanh động": ["Action", "Adventure", "Super Power", "Martial Arts"],
+    "Hành động": ["Action", "Adventure", "Super Power", "Martial Arts"],
     "Drama": ["Drama", "Romance", "School"],
     "Hồi hộp / bí ẩn": ["Mystery", "Psychological", "Thriller", "Horror"],
     "Phiêu lưu / fantasy": ["Adventure", "Fantasy", "Magic", "Supernatural"],
@@ -457,7 +458,7 @@ def recommend_for_new_viewer(
 def _extract_jikan_image_url(payload: dict) -> str | None:
     images = payload.get("images", {})
     jpg_images = images.get("jpg", {})
-    return jpg_images.get("large_image_url") or jpg_images.get("image_url")
+    return jpg_images.get("image_url") or jpg_images.get("large_image_url") or jpg_images.get("small_image_url")
 
 
 def _jikan_get(url: str, **kwargs) -> requests.Response:
@@ -473,37 +474,44 @@ def _download_image_bytes(image_url: str | None) -> bytes | None:
     response = _jikan_get(image_url, timeout=8)
     if response.status_code != 200:
         return None
+    if "image" not in response.headers.get("content-type", ""):
+        return None
     return response.content
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def get_poster_bytes(anime_id: int, anime_name: str, cache_version: str = POSTER_CACHE_VERSION) -> bytes | None:
     _ = cache_version
-    try:
-        headers = {"User-Agent": "Anime-Recommender-System/1.0"}
+    headers = {"User-Agent": "Anime-Recommender-System/1.0"}
 
-        response = _jikan_get(f"https://api.jikan.moe/v4/anime/{int(anime_id)}", headers=headers, timeout=8)
-        if response.status_code == 200:
-            data = response.json()
-            image_bytes = _download_image_bytes(_extract_jikan_image_url(data.get("data", {})))
-            if image_bytes:
-                return image_bytes
+    for attempt in range(3):
+        try:
+            response = _jikan_get(f"https://api.jikan.moe/v4/anime/{int(anime_id)}", headers=headers, timeout=8)
+            if response.status_code == 200:
+                data = response.json()
+                image_bytes = _download_image_bytes(_extract_jikan_image_url(data.get("data", {})))
+                if image_bytes:
+                    return image_bytes
 
-        response = _jikan_get(
-            "https://api.jikan.moe/v4/anime",
-            params={"q": anime_name, "limit": 1},
-            headers=headers,
-            timeout=8,
-        )
-        if response.status_code == 200:
-            data = response.json()
-            matches = data.get("data", [])
-            if matches:
-                return _download_image_bytes(_extract_jikan_image_url(matches[0]))
-    except requests.RequestException:
-        return None
+            response = _jikan_get(
+                "https://api.jikan.moe/v4/anime",
+                params={"q": anime_name, "limit": 1},
+                headers=headers,
+                timeout=8,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                matches = data.get("data", [])
+                if matches:
+                    image_bytes = _download_image_bytes(_extract_jikan_image_url(matches[0]))
+                    if image_bytes:
+                        return image_bytes
+        except requests.RequestException:
+            pass
 
-    return None
+        time.sleep(0.5 * (attempt + 1))
+
+    raise RuntimeError(f"Poster not available for anime_id={anime_id}")
 
 
 def get_poster_batch(batch: pd.DataFrame) -> dict[int, bytes | None]:
@@ -512,7 +520,7 @@ def get_poster_batch(batch: pd.DataFrame) -> dict[int, bytes | None]:
     if not rows:
         return poster_map
 
-    max_workers = min(5, len(rows))
+    max_workers = min(3, len(rows))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(get_poster_bytes, anime_id, anime_name): anime_id
@@ -522,7 +530,7 @@ def get_poster_batch(batch: pd.DataFrame) -> dict[int, bytes | None]:
             anime_id = futures[future]
             try:
                 poster_map[anime_id] = future.result()
-            except requests.RequestException:
+            except Exception:
                 poster_map[anime_id] = None
 
     return poster_map
