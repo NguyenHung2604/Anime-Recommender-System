@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import re
 
@@ -14,8 +15,6 @@ from sklearn.preprocessing import normalize
 from als_recommender import ALSConfig, ExplicitALSRecommender
 
 import requests
-import urllib.parse
-import time
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -25,10 +24,20 @@ MODEL_DIR = BASE_DIR / "artifacts" / "als_model"
 MODEL_FILENAME = "als_model.pkl"
 
 
-st.set_page_config(page_title="Anime Hybrid Recommender", layout="wide")
+st.set_page_config(
+    page_title="Anime Hybrid Recommender",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
 NAME_CLEANING_VERSION = "v2"
-RECOMMENDER_VERSION = "strict_title_similarity_v2"
+RECOMMENDER_VERSION = "strict_title_similarity_v3"
+
+
+DEFAULT_TOP_K = 5
+DEFAULT_CONTENT_WEIGHT = 0.4
+DEFAULT_TITLE_WEIGHT = 0.3
+POSTER_CACHE_VERSION = "v2_no_proxy"
 
 
 def clean_anime_name(name: object) -> str:
@@ -40,6 +49,11 @@ def clean_anime_name(name: object) -> str:
     cleaned = re.sub(r"^\.?quot;\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"^\s*[\"']?\.hack//", "hack//", cleaned, flags=re.IGNORECASE)
     return cleaned
+
+
+def format_anime_label(anime_id: object, anime_name: object) -> str:
+    name = clean_anime_name(anime_name) or str(anime_id)
+    return f"{name} (ID: {int(anime_id)})"
 
 
 @st.cache_data
@@ -159,7 +173,7 @@ def shared_prefix_ratio(query_title: str, candidate_title: str) -> float:
         prefix_len += 1
 
     min_len = min(len(query_tokens), len(candidate_tokens))
-    if prefix_len < min(2, min_len):
+    if prefix_len < min(3, min_len):
         return 0.0
 
     return prefix_len / max(len(query_tokens), len(candidate_tokens))
@@ -207,14 +221,11 @@ def title_similarity_scores(anime_lookup: pd.DataFrame, query_idx: int) -> np.nd
     return scores
 
 
-def add_title_similarity_if_missing(
+def recompute_title_similarity(
     similar_df: pd.DataFrame,
     anime_lookup: pd.DataFrame,
     query_anime_id: int,
 ) -> pd.DataFrame:
-    if "title_similarity" in similar_df.columns:
-        return similar_df
-
     id_to_idx = {anime_id: idx for idx, anime_id in enumerate(anime_lookup["anime_id"].tolist())}
     if query_anime_id not in id_to_idx:
         similar_df = similar_df.copy()
@@ -231,6 +242,44 @@ def add_title_similarity_if_missing(
     return similar_df
 
 
+def rerank_with_current_title_rules(
+    similar_df: pd.DataFrame,
+    anime_lookup: pd.DataFrame,
+    query_anime_id: int,
+    top_k: int,
+    content_weight: float,
+    title_weight: float,
+) -> pd.DataFrame:
+    similar_df = recompute_title_similarity(similar_df, anime_lookup, query_anime_id)
+
+    has_hybrid_columns = {"als_similarity", "content_similarity", "title_similarity"}.issubset(similar_df.columns)
+    if has_hybrid_columns:
+        if "hybrid_score" in similar_df.columns:
+            similar_df["hybrid_score"] = similar_df["hybrid_score"].astype("float64")
+
+        title_weight = float(np.clip(title_weight, 0.0, 1.0))
+        content_share = float(np.clip(content_weight, 0.0, 1.0))
+        base_weight = 1.0 - title_weight
+        als_weight = base_weight * (1.0 - content_share)
+        effective_content_weight = base_weight * content_share
+
+        trained_mask = similar_df["als_similarity"].notna() & similar_df["content_similarity"].notna()
+        updated_scores = (
+            als_weight * similar_df.loc[trained_mask, "als_similarity"].astype("float64").to_numpy()
+            + effective_content_weight * similar_df.loc[trained_mask, "content_similarity"].astype("float64").to_numpy()
+            + title_weight * similar_df.loc[trained_mask, "title_similarity"].fillna(0.0).astype("float64").to_numpy()
+        )
+        similar_df.loc[trained_mask, "hybrid_score"] = updated_scores
+
+        metadata_mask = similar_df["als_similarity"].isna() & similar_df["content_similarity"].isna()
+        similar_df = similar_df[~metadata_mask | (similar_df["title_similarity"].fillna(0.0) >= 0.85)].copy()
+
+    if "hybrid_score" in similar_df.columns:
+        similar_df = similar_df.sort_values("hybrid_score", ascending=False)
+
+    return similar_df.head(top_k).reset_index(drop=True)
+
+
 def existing_columns(frame: pd.DataFrame, columns: list[str]) -> list[str]:
     return [column for column in columns if column in frame.columns]
 
@@ -240,7 +289,7 @@ def content_similar_anime(
     content_matrix: csr_matrix,
     query_anime_id: int,
     top_k: int,
-    title_weight: float = 0.45,
+    title_weight: float = 0.3,
 ) -> pd.DataFrame:
     id_to_idx = {anime_id: idx for idx, anime_id in enumerate(anime_lookup["anime_id"].tolist())}
     if query_anime_id not in id_to_idx:
@@ -405,23 +454,78 @@ def recommend_for_new_viewer(
     result["matched_genres"] = ", ".join(target_genres) if target_genres else "All"
     return result.reset_index(drop=True), alpha, reason
 
-@st.cache_data(show_spinner=False)
-def get_poster_by_name(anime_name):
-    """Tìm kiếm poster dựa trên tên anime qua Jikan API"""
+def _extract_jikan_image_url(payload: dict) -> str | None:
+    images = payload.get("images", {})
+    jpg_images = images.get("jpg", {})
+    return jpg_images.get("large_image_url") or jpg_images.get("image_url")
+
+
+def _jikan_get(url: str, **kwargs) -> requests.Response:
+    session = requests.Session()
+    session.trust_env = False
+    return session.get(url, **kwargs)
+
+
+def _download_image_bytes(image_url: str | None) -> bytes | None:
+    if not image_url:
+        return None
+
+    response = _jikan_get(image_url, timeout=8)
+    if response.status_code != 200:
+        return None
+    return response.content
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def get_poster_bytes(anime_id: int, anime_name: str, cache_version: str = POSTER_CACHE_VERSION) -> bytes | None:
+    _ = cache_version
     try:
-        time.sleep(0.35)
-        # Mã hóa tên để tránh lỗi khi tên có khoảng trắng hoặc ký tự đặc biệt
-        encoded_name = urllib.parse.quote(anime_name)
-        url = f"https://api.jikan.moe/v4/anime?q={encoded_name}&limit=1"
-        
-        response = requests.get(url, timeout=5)
+        headers = {"User-Agent": "Anime-Recommender-System/1.0"}
+
+        response = _jikan_get(f"https://api.jikan.moe/v4/anime/{int(anime_id)}", headers=headers, timeout=8)
         if response.status_code == 200:
             data = response.json()
-            if data['data']:
-                return data['data'][0]['images']['jpg']['image_url']
-        return "https://via.placeholder.com/225x350?text=No+Image"
-    except:
-        return "https://via.placeholder.com/225x350?text=Error"
+            image_bytes = _download_image_bytes(_extract_jikan_image_url(data.get("data", {})))
+            if image_bytes:
+                return image_bytes
+
+        response = _jikan_get(
+            "https://api.jikan.moe/v4/anime",
+            params={"q": anime_name, "limit": 1},
+            headers=headers,
+            timeout=8,
+        )
+        if response.status_code == 200:
+            data = response.json()
+            matches = data.get("data", [])
+            if matches:
+                return _download_image_bytes(_extract_jikan_image_url(matches[0]))
+    except requests.RequestException:
+        return None
+
+    return None
+
+
+def get_poster_batch(batch: pd.DataFrame) -> dict[int, bytes | None]:
+    poster_map: dict[int, bytes | None] = {}
+    rows = [(int(row["anime_id"]), str(row["name"])) for _, row in batch.iterrows()]
+    if not rows:
+        return poster_map
+
+    max_workers = min(5, len(rows))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(get_poster_bytes, anime_id, anime_name): anime_id
+            for anime_id, anime_name in rows
+        }
+        for future in as_completed(futures):
+            anime_id = futures[future]
+            try:
+                poster_map[anime_id] = future.result()
+            except requests.RequestException:
+                poster_map[anime_id] = None
+
+    return poster_map
     
 
 def display_anime_cards(df, columns_per_row=5):
@@ -433,16 +537,36 @@ def display_anime_cards(df, columns_per_row=5):
     for i in range(0, n_results, columns_per_row):
         cols = st.columns(columns_per_row)
         batch = df.iloc[i : i + columns_per_row]
+        poster_map = get_poster_batch(batch)
         
         for idx, (index, row) in enumerate(batch.iterrows()):
             with cols[idx]:
-                # Sử dụng cột 'name' trong dataframe để tìm poster
-                poster_url = get_poster_by_name(row['name'])
-                st.image(poster_url, use_container_width=True)
+                poster_bytes = poster_map.get(int(row["anime_id"]))
+                if poster_bytes:
+                    st.image(poster_bytes, use_container_width=True)
+                else:
+                    st.markdown(
+                        """
+                        <div style="
+                            width: 100%;
+                            aspect-ratio: 225 / 320;
+                            border: 1px solid rgba(255,255,255,0.18);
+                            border-radius: 6px;
+                            display: flex;
+                            align-items: center;
+                            justify-content: center;
+                            color: rgba(255,255,255,0.55);
+                            background: rgba(255,255,255,0.04);
+                            font-size: 0.9rem;
+                        ">No poster</div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
                 
                 # Hiển thị tên anime rút gọn
-                display_name = row['name']
-                st.markdown(f"**{display_name[:40]}{'...' if len(display_name) > 40 else ''}**")
+                short_name = row["name"][:40] + "..." if len(row["name"]) > 40 else row["name"]
+                display_name = format_anime_label(row["anime_id"], short_name)
+                st.markdown(f"**{display_name}**")
                 
                 # Hiển thị điểm số nếu có[cite: 1]
                 if 'hybrid_score' in row and pd.notna(row['hybrid_score']):
@@ -497,10 +621,18 @@ def show_query_result(
     similar_df = model.hybrid_similar_anime(
         query_anime_id,
         anime_lookup,
-        top_k=top_k,
+        top_k=top_k + 10,
         content_weight=content_weight,
+        title_weight=DEFAULT_TITLE_WEIGHT,
     )
-    similar_df = add_title_similarity_if_missing(similar_df, anime_lookup, query_anime_id)
+    similar_df = rerank_with_current_title_rules(
+        similar_df,
+        anime_lookup,
+        query_anime_id,
+        top_k,
+        content_weight,
+        DEFAULT_TITLE_WEIGHT,
+    )
     st.success(f"Top {top_k} anime similar to: {query_name}")
 
     #hiển thị poster
@@ -564,65 +696,28 @@ def show_new_viewer_recommendations(
 st.title("Anime Recommender System")
 st.write("Hybrid = ALS collaborative similarity + content similarity from genre, type, rating, and members.")
 st.write("Power by Save AI")
+st.markdown(
+    """
+    <style>
+    [data-testid="stSidebar"],
+    [data-testid="collapsedControl"] {
+        display: none;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-with st.sidebar:
-    st.header("Model")
-    saved_model_exists = (MODEL_DIR / MODEL_FILENAME).exists()
-    default_model_source = "Load saved model" if saved_model_exists else "Train in app"
-    model_source = st.radio(
-        "Model source",
-        ["Load saved model", "Train in app"],
-        index=0 if default_model_source == "Load saved model" else 1,
-        help="Use a saved model for fast startup. Train in app is mainly for experiments.",
-    )
+saved_model_exists = (MODEL_DIR / MODEL_FILENAME).exists()
+top_k = DEFAULT_TOP_K
+content_weight = DEFAULT_CONTENT_WEIGHT
 
-    st.header("Training")
-    train_all_rows = st.checkbox(
-        "Use all rating.csv rows",
-        value=False,
-        disabled=model_source == "Load saved model",
-        help="rating.csv has millions of rows, so full training should usually be done once from the command line.",
-    )
-    if train_all_rows:
-        max_rows = None
-        st.caption("Using all rows from rating.csv.")
-    else:
-        max_rows = st.slider(
-            "Rating rows",
-            min_value=5000,
-            max_value=100000,
-            value=10000,
-            step=5000,
-            disabled=model_source == "Load saved model",
-            help="Number of rating rows loaded from rating.csv for quick training experiments.",
-        )
-
-    n_factors = st.slider("ALS latent factors", min_value=8, max_value=64, value=16, step=8, disabled=model_source == "Load saved model")
-    n_iters = st.slider("ALS iterations", min_value=2, max_value=10, value=4, step=1, disabled=model_source == "Load saved model")
-    reg = st.slider("Regularization", min_value=0.01, max_value=1.0, value=0.1, step=0.01, disabled=model_source == "Load saved model")
-    random_state = st.number_input("Random state", min_value=0, max_value=9999, value=42, step=1, disabled=model_source == "Load saved model")
-
-    st.header("Hybrid")
-    top_k = st.slider("Number of similar anime", min_value=5, max_value=20, value=5, step=1)
-    content_weight = st.slider(
-        "Content weight",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.6,
-        step=0.05,
-        help="0 = ALS only, 1 = content only. Try 0.5 to 0.7 for search-by-anime.",
-    )
-
-if model_source == "Load saved model" and saved_model_exists:
+if saved_model_exists:
     with st.spinner("Loading saved ALS model..."):
         model, anime_df = load_saved_model(str(MODEL_DIR), recommender_version=RECOMMENDER_VERSION)
-elif model_source == "Load saved model":
-    st.warning("Saved model not found. Training in app instead.")
-    with st.spinner("Training ALS model..."):
-        model, anime_df = train_model(max_rows, n_factors, n_iters, reg, int(random_state), RECOMMENDER_VERSION)
 else:
-    with st.spinner("Training ALS model..."):
-        model, anime_df = train_model(max_rows, n_factors, n_iters, reg, int(random_state), RECOMMENDER_VERSION)
+    st.error(f"Saved model not found: {MODEL_DIR / MODEL_FILENAME}")
+    st.stop()
 
 trained_item_ids = set(model.item_ids.tolist()) if model.item_ids is not None else set()
 anime_lookup_full, content_matrix = build_content_lookup_and_matrix(anime_df)
@@ -634,11 +729,11 @@ with tab_search:
     selected_anime_id = st.selectbox(
         "Choose anime",
         anime_lookup_full["anime_id"].tolist(),
-        format_func=lambda anime_id: anime_name_map.get(anime_id, str(anime_id)),
+        format_func=lambda anime_id: format_anime_label(anime_id, anime_name_map.get(anime_id, anime_id)),
     )
     if st.button("Find similar anime", key="search_by_name"):
         query_anime_id = int(selected_anime_id)
-        query_name = anime_name_map.get(query_anime_id, str(query_anime_id))
+        query_name = format_anime_label(query_anime_id, anime_name_map.get(query_anime_id, query_anime_id))
         try:
             show_query_result(
                 model,
@@ -663,7 +758,11 @@ with tab_id:
         try:
             query_anime_id = int(anime_id_input)
             query_row = anime_lookup_full[anime_lookup_full["anime_id"] == query_anime_id]
-            query_name = query_row.iloc[0]["name"] if not query_row.empty else str(query_anime_id)
+            query_name = (
+                format_anime_label(query_anime_id, query_row.iloc[0]["name"])
+                if not query_row.empty
+                else str(query_anime_id)
+            )
             show_query_result(
                 model,
                 anime_lookup_full,
@@ -706,7 +805,7 @@ with tab_recommendations:
     known_anime_ids = st.multiselect(
         "Tick vài anime bạn đã biết (có thể bỏ qua)",
         starter_options["anime_id"].tolist(),
-        format_func=lambda anime_id: starter_name_map.get(anime_id, str(anime_id)),
+        format_func=lambda anime_id: format_anime_label(anime_id, starter_name_map.get(anime_id, anime_id)),
         help="Nếu tick 3-5 anime, hệ thống sẽ tạo content profile ban đầu. Nếu bỏ qua, sẽ dùng Top Popular theo phân khúc.",
     )
 
@@ -747,7 +846,7 @@ with tab_recommendations:
         "Seed anime for new users (content-based)",
         anime_lookup_full["anime_id"].tolist(),
         index=0,
-        format_func=lambda anime_id: seed_anime_name_map.get(anime_id, str(anime_id)),
+        format_func=lambda anime_id: format_anime_label(anime_id, seed_anime_name_map.get(anime_id, anime_id)),
         help="Dùng khi user chưa có rating trong dữ liệu train.",
     )
     if st.button("Get recommendations", key="get_recommendations"):
