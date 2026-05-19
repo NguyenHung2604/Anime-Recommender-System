@@ -18,6 +18,8 @@ from sklearn.preprocessing import normalize
 
 @dataclass
 class ALSConfig:
+    """Các tham số chính của ALS: số chiều latent, số vòng lặp, regularization và seed."""
+
     n_factors: int = 16
     n_iters: int = 5
     reg: float = 0.1
@@ -26,6 +28,8 @@ class ALSConfig:
 
 class ExplicitALSRecommender:
     def __init__(self, config: ALSConfig | None = None):
+        """Tạo model rỗng; các ma trận user/item factor chỉ có sau khi gọi fit()."""
+
         self.config = config or ALSConfig()
         self.global_mean: float = 0.0
         self.user_factors: np.ndarray | None = None
@@ -39,6 +43,8 @@ class ExplicitALSRecommender:
         self._ratings_by_user: dict[int, set[int]] = {}
 
     def fit(self, ratings: pd.DataFrame) -> "ExplicitALSRecommender":
+        """Train ALS từ bảng rating, chỉ dùng rating dương và lưu lại mapping user/anime."""
+
         required_columns = {"user_id", "anime_id", "rating"}
         missing_columns = required_columns - set(ratings.columns)
         if missing_columns:
@@ -98,6 +104,8 @@ class ExplicitALSRecommender:
         return self
 
     def _build_user_history(self, ratings: pd.DataFrame) -> dict[int, set[int]]:
+        """Lưu những anime mỗi user đã rating để lúc recommend có thể loại anime đã xem."""
+
         history: dict[int, set[int]] = {}
         for user_id, group in ratings.groupby("user_id"):
             history[int(user_id)] = set(group["anime_id"].astype(np.int64).tolist())
@@ -109,6 +117,8 @@ class ExplicitALSRecommender:
         fixed_factors: np.ndarray,
         reg_eye: np.ndarray,
     ) -> np.ndarray:
+        """Một bước ALS: giữ một phía cố định rồi giải least squares cho phía còn lại."""
+
         n_rows = rating_matrix.shape[0]
         n_factors = fixed_factors.shape[1]
         updated = np.zeros((n_rows, n_factors), dtype=np.float32)
@@ -130,6 +140,8 @@ class ExplicitALSRecommender:
         return updated
 
     def predict(self, user_id: int, anime_id: int) -> float:
+        """Dự đoán rating cho một cặp user-anime; user/item lạ thì trả về trung bình chung."""
+
         if self.user_factors is None or self.item_factors is None:
             raise ValueError("Model has not been fit yet.")
         if user_id not in self.user_to_idx or anime_id not in self.item_to_idx:
@@ -141,6 +153,8 @@ class ExplicitALSRecommender:
         return float(np.clip(score, 1.0, 10.0))
 
     def evaluate(self, ratings: pd.DataFrame) -> dict[str, float | int]:
+        """Đánh giá model bằng RMSE/MAE và so với baseline luôn đoán rating trung bình."""
+
         if self.user_factors is None or self.item_factors is None:
             raise ValueError("Model has not been fit yet.")
 
@@ -174,6 +188,8 @@ class ExplicitALSRecommender:
         }
 
     def _prepare_anime_lookup(self, anime_df: pd.DataFrame) -> pd.DataFrame:
+        """Chuẩn hóa anime_id rồi set anime_id làm index để join metadata nhanh và ổn định."""
+
         anime_lookup = anime_df.copy()
         anime_lookup["anime_id"] = pd.to_numeric(anime_lookup["anime_id"], errors="coerce")
         anime_lookup = anime_lookup.dropna(subset=["anime_id"])
@@ -182,6 +198,8 @@ class ExplicitALSRecommender:
         return anime_lookup.set_index("anime_id")
 
     def find_anime_id_by_name(self, anime_df: pd.DataFrame, anime_name: str) -> int:
+        """Tìm anime_id từ tên, ưu tiên match chính xác rồi mới match gần đúng theo chuỗi."""
+
         anime_lookup = anime_df.copy()
         anime_lookup["anime_id"] = pd.to_numeric(anime_lookup["anime_id"], errors="coerce")
         anime_lookup = anime_lookup.dropna(subset=["anime_id", "name"])
@@ -204,6 +222,8 @@ class ExplicitALSRecommender:
         raise ValueError(f'Could not find anime name matching "{anime_name}".')
 
     def _als_similarity_scores(self, anime_id: int) -> np.ndarray:
+        """Tính độ giống nhau theo collaborative filtering bằng cosine giữa item factors."""
+
         if self.item_factors is None or self.item_ids is None:
             raise ValueError("Model has not been fit yet.")
         if anime_id not in self.item_to_idx:
@@ -220,6 +240,8 @@ class ExplicitALSRecommender:
         return scores
 
     def _content_similarity_scores(self, anime_id: int, anime_df: pd.DataFrame) -> np.ndarray:
+        """Tính độ giống nhau theo metadata: genre, type, rating và members."""
+
         if self.item_ids is None:
             raise ValueError("Model has not been fit yet.")
         if anime_id not in self.item_to_idx:
@@ -233,6 +255,8 @@ class ExplicitALSRecommender:
         return scores
 
     def _build_content_matrix(self, anime_df: pd.DataFrame) -> csr_matrix:
+        """Biến metadata anime thành ma trận feature đã normalize để tính cosine similarity."""
+
         if self.item_ids is None:
             raise ValueError("Model has not been fit yet.")
 
@@ -265,6 +289,8 @@ class ExplicitALSRecommender:
         return normalize(hstack([genre_features, type_features, numeric_features]).tocsr())
 
     def _normalize_title(self, title: object) -> str:
+        """Làm sạch title để so khớp franchise: bỏ ngoặc, ký tự lạ và chuẩn hóa chữ thường."""
+
         if pd.isna(title):
             return ""
 
@@ -274,6 +300,8 @@ class ExplicitALSRecommender:
         return re.sub(r"\s+", " ", text).strip()
 
     def _shared_prefix_ratio(self, query_title: str, candidate_title: str) -> float:
+        """Đo xem hai title có cùng phần đầu không, hữu ích cho season/OVA cùng series."""
+
         query_tokens = query_title.split()
         candidate_tokens = candidate_title.split()
         if not query_tokens or not candidate_tokens:
@@ -286,12 +314,14 @@ class ExplicitALSRecommender:
             prefix_len += 1
 
         min_len = min(len(query_tokens), len(candidate_tokens))
-        if prefix_len < min(2, min_len):
+        if prefix_len < min(3, min_len):
             return 0.0
 
         return prefix_len / max(len(query_tokens), len(candidate_tokens))
 
     def _title_similarity_score_pair(self, query_title: str, candidate_title: str) -> float:
+        """Chấm điểm giống title theo luật chặt: exact, prefix, chứa cụm title, rồi token overlap."""
+
         if not query_title or not candidate_title:
             return 0.0
 
@@ -321,6 +351,8 @@ class ExplicitALSRecommender:
         return float(token_score if token_score >= 0.5 else 0.0)
 
     def _title_similarity_scores(self, anime_id: int, anime_df: pd.DataFrame) -> np.ndarray:
+        """Tính title similarity từ anime đang query đến toàn bộ anime có trong ALS model."""
+
         if self.item_ids is None:
             raise ValueError("Model has not been fit yet.")
         if anime_id not in self.item_to_idx:
@@ -351,6 +383,8 @@ class ExplicitALSRecommender:
         anime_df: pd.DataFrame,
         min_title_score: float = 0.85,
     ) -> pd.DataFrame:
+        """Kéo thêm anime cùng franchise nhưng không có trong ALS train set, nếu title match đủ chặt."""
+
         if self.item_ids is None:
             raise ValueError("Model has not been fit yet.")
 
@@ -388,6 +422,8 @@ class ExplicitALSRecommender:
         return pd.DataFrame(rows)
 
     def _top_indices(self, scores: np.ndarray, top_k: int) -> np.ndarray:
+        """Lấy top_k index có score cao nhất, dùng argpartition để nhanh hơn sort toàn bộ."""
+
         if top_k >= len(scores):
             return np.argsort(-scores)
 
@@ -400,6 +436,8 @@ class ExplicitALSRecommender:
         anime_df: pd.DataFrame,
         top_k: int = 5,
     ) -> pd.DataFrame:
+        """Trả về anime tương tự chỉ theo ALS item factors, chưa pha thêm content/title."""
+
         anime_lookup = self._prepare_anime_lookup(anime_df)
         similarity = self._als_similarity_scores(anime_id)
         top_indices = self._top_indices(similarity, top_k)
@@ -420,8 +458,10 @@ class ExplicitALSRecommender:
         anime_df: pd.DataFrame,
         top_k: int = 5,
         content_weight: float = 0.5,
-        title_weight: float = 0.45,
+        title_weight: float = 0.3,
     ) -> pd.DataFrame:
+        """Trộn ALS, content và title similarity để kết quả vừa theo hành vi user vừa bám franchise."""
+
         if self.item_ids is None:
             raise ValueError("Model has not been fit yet.")
 
@@ -464,6 +504,8 @@ class ExplicitALSRecommender:
         top_k: int = 10,
         exclude_seen: bool = True,
     ) -> pd.DataFrame:
+        """Gợi ý anime cho user; user cũ dùng factor, user mới fallback sang popularity."""
+
         if self.user_factors is None or self.item_factors is None:
             raise ValueError("Model has not been fit yet.")
 
@@ -508,6 +550,8 @@ class ExplicitALSRecommender:
         model_filename: str = "als_model.pkl",
         metadata_extra: dict[str, object] | None = None,
     ) -> None:
+        """Lưu model factor bằng pickle và lưu metadata train ra file JSON để dễ kiểm tra."""
+
         if self.user_factors is None or self.item_factors is None:
             raise ValueError("Model has not been fit yet.")
 
@@ -549,6 +593,8 @@ class ExplicitALSRecommender:
 
     @classmethod
     def load(cls, directory: str | Path, model_filename: str = "als_model.pkl") -> "ExplicitALSRecommender":
+        """Load lại model đã save, dùng cho app để khỏi phải train lại mỗi lần chạy."""
+
         directory = Path(directory)
         with open(directory / model_filename, "rb") as handle:
             payload = pickle.load(handle)
@@ -569,6 +615,8 @@ class ExplicitALSRecommender:
 
 
 def load_data(ratings_path: str | Path, anime_path: str | Path, max_rows: int | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Đọc rating.csv và anime.csv; max_rows dùng khi muốn train thử nhanh."""
+
     ratings = pd.read_csv(ratings_path)
     anime = pd.read_csv(anime_path)
 
@@ -579,6 +627,8 @@ def load_data(ratings_path: str | Path, anime_path: str | Path, max_rows: int | 
 
 
 def clean_explicit_ratings(ratings: pd.DataFrame) -> pd.DataFrame:
+    """Làm sạch rating explicit: ép kiểu số, bỏ missing và bỏ rating <= 0."""
+
     required_columns = {"user_id", "anime_id", "rating"}
     missing_columns = required_columns - set(ratings.columns)
     if missing_columns:
@@ -601,6 +651,8 @@ def train_test_split_by_user(
     test_size: float = 0.1,
     random_state: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Chia train/test theo từng user để mỗi user vẫn còn dữ liệu train."""
+
     train, _, test = train_dev_test_split_by_user(
         ratings,
         dev_size=0.0,
@@ -616,6 +668,8 @@ def train_dev_test_split_by_user(
     test_size: float = 0.1,
     random_state: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Chia train/dev/test theo user, tránh việc một user bị dồn hết rating sang test."""
+
     data = clean_explicit_ratings(ratings)
     if data.empty:
         raise ValueError("No positive ratings found after filtering rating > 0.")
@@ -673,6 +727,8 @@ def evaluate_als_model(
     pd.DataFrame,
     pd.DataFrame,
 ]:
+    """Train một model với config cho trước rồi trả về metrics trên dev/test."""
+
     train_ratings, dev_ratings, test_ratings = train_dev_test_split_by_user(
         ratings,
         dev_size=dev_size,
@@ -693,6 +749,8 @@ def evaluate_als_model(
 
 
 def parse_int_grid(value: str) -> list[int]:
+    """Parse chuỗi kiểu '16,32,64' thành list int để chạy tuning."""
+
     values = [int(part.strip()) for part in value.split(",") if part.strip()]
     if not values:
         raise ValueError("Grid must contain at least one integer value.")
@@ -702,6 +760,8 @@ def parse_int_grid(value: str) -> list[int]:
 
 
 def parse_float_grid(value: str) -> list[float]:
+    """Parse chuỗi kiểu '0.05,0.1,0.2' thành list float để chạy tuning."""
+
     values = [float(part.strip()) for part in value.split(",") if part.strip()]
     if not values:
         raise ValueError("Grid must contain at least one float value.")
@@ -725,6 +785,8 @@ def tune_als_model(
     pd.DataFrame,
     pd.DataFrame,
 ]:
+    """Thử nhiều bộ tham số ALS, chọn model có RMSE tốt nhất trên dev set."""
+
     train_ratings, dev_ratings, test_ratings = train_dev_test_split_by_user(
         ratings,
         dev_size=dev_size,
@@ -790,6 +852,8 @@ def tune_als_model(
 
 
 def main() -> None:
+    """Entry point dòng lệnh: train/tune model, in kết quả thử và lưu artifact."""
+
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
