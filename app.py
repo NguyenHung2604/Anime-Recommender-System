@@ -347,7 +347,7 @@ def content_similar_anime(
 MOOD_GENRE_MAP = {
     "Không chọn": [],
     "Nhẹ nhàng": ["Comedy", "Slice of Life", "Romance"],
-    "Hanh động": ["Action", "Adventure", "Super Power", "Martial Arts"],
+    "Hành động": ["Action", "Adventure", "Super Power", "Martial Arts"],
     "Drama": ["Drama", "Romance", "School"],
     "Hồi hộp / bí ẩn": ["Mystery", "Psychological", "Thriller", "Horror"],
     "Phiêu lưu / fantasy": ["Adventure", "Fantasy", "Magic", "Supernatural"],
