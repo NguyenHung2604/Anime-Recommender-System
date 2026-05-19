@@ -16,7 +16,7 @@ from als_recommender import ALSConfig, ExplicitALSRecommender
 
 import requests
 
-
+#lấy đường dẫn tới các file
 BASE_DIR = Path(__file__).resolve().parent
 RATINGS_PATH = BASE_DIR / "anime data" / "rating.csv"
 ANIME_PATH = BASE_DIR / "anime data" / "anime.csv"
@@ -30,6 +30,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+#version
 NAME_CLEANING_VERSION = "v2"
 RECOMMENDER_VERSION = "strict_title_similarity_v3"
 
@@ -39,7 +40,7 @@ DEFAULT_CONTENT_WEIGHT = 0.4
 DEFAULT_TITLE_WEIGHT = 0.3
 POSTER_CACHE_VERSION = "v2_no_proxy"
 
-
+#chuẩn hóa lại tên anime do có các kí tự lỗi, thừa
 def clean_anime_name(name: object) -> str:
     if pd.isna(name):
         return ""
@@ -57,6 +58,7 @@ def format_anime_label(anime_id: object, anime_name: object) -> str:
 
 
 @st.cache_data
+#load data từ anime.csv và rating.csv và làm sạch
 def load_data(
     max_rows: int | None = None,
     cleaning_version: str = NAME_CLEANING_VERSION,
@@ -65,11 +67,12 @@ def load_data(
     ratings = pd.read_csv(RATINGS_PATH)
     anime = pd.read_csv(ANIME_PATH)
     anime["name"] = anime["name"].apply(clean_anime_name)
+    #giới hạn số rows trong dataset rating
     if max_rows is not None and max_rows > 0:
         ratings = ratings.head(max_rows).copy()
     return ratings, anime
 
-
+#lưu tham số để không phải train lại
 @st.cache_resource
 def train_model(
     max_rows: int | None,
@@ -79,8 +82,10 @@ def train_model(
     random_state: int,
     recommender_version: str = RECOMMENDER_VERSION,
 ) -> tuple[ExplicitALSRecommender, pd.DataFrame]:
+    
     _ = recommender_version
     ratings_df, anime_df = load_data(max_rows=max_rows, cleaning_version=NAME_CLEANING_VERSION)
+
     model = ExplicitALSRecommender(
         ALSConfig(
             n_factors=n_factors,
@@ -89,40 +94,51 @@ def train_model(
             random_state=random_state,
         )
     )
+
     model.fit(ratings_df)
+
     return model, anime_df
 
 
 @st.cache_resource
+#load model có sẵn thay vì phải train
 def load_saved_model(
     model_dir: str,
     model_filename: str = MODEL_FILENAME,
     recommender_version: str = RECOMMENDER_VERSION,
 ) -> tuple[ExplicitALSRecommender, pd.DataFrame]:
+    
     _ = recommender_version
     model = ExplicitALSRecommender.load(model_dir, model_filename=model_filename)
     _, anime_df = load_data(max_rows=None, cleaning_version=NAME_CLEANING_VERSION)
     return model, anime_df
 
-
+#chuẩn hóa dữ liệu anime
 def prepare_anime_options(
     anime_df: pd.DataFrame,
     trained_item_ids: set[int] | None = None,
 ) -> pd.DataFrame:
+    
+    #loại bỏ dữ liệu rác
     anime_lookup = anime_df.copy()
     anime_lookup["anime_id"] = pd.to_numeric(anime_lookup["anime_id"], errors="coerce")
     anime_lookup = anime_lookup.dropna(subset=["anime_id", "name"])
     anime_lookup["anime_id"] = anime_lookup["anime_id"].astype(int)
     anime_lookup = anime_lookup.drop_duplicates(subset=["anime_id"])
+    #giữ lại các anime đã được model học
     if trained_item_ids is not None:
         anime_lookup = anime_lookup[anime_lookup["anime_id"].isin(trained_item_ids)].copy()
+    
+    #sắp xếp theo name
     return anime_lookup.sort_values("name")
 
 
 @st.cache_resource
+#biến đổi thông tin dạng chữ thành ma trận số
 def build_content_lookup_and_matrix(anime_df: pd.DataFrame) -> tuple[pd.DataFrame, csr_matrix]:
     anime_lookup = prepare_anime_options(anime_df).reset_index(drop=True)
 
+    #xử lí phần genre bằng tfidf
     genre_text = anime_lookup.get("genre", pd.Series("", index=anime_lookup.index))
     genre_text = genre_text.fillna("").astype(str).str.replace(",", " ", regex=False)
     if genre_text.str.strip().any():
@@ -130,10 +146,12 @@ def build_content_lookup_and_matrix(anime_df: pd.DataFrame) -> tuple[pd.DataFram
     else:
         genre_features = csr_matrix((len(anime_lookup), 0), dtype=np.float32)
 
+    #xử lí phần type_series bằng one-hot encoding
     type_series = anime_lookup.get("type", pd.Series("Unknown", index=anime_lookup.index))
     type_dummies = pd.get_dummies(type_series.fillna("Unknown").astype(str), dtype=np.float32)
     type_features = csr_matrix(type_dummies.to_numpy(dtype=np.float32))
 
+    #xử lí phần rating, members bằng min-max normalization
     numeric_columns = [column for column in ["rating", "members"] if column in anime_lookup.columns]
     if numeric_columns:
         numeric = anime_lookup[numeric_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0)
@@ -146,10 +164,11 @@ def build_content_lookup_and_matrix(anime_df: pd.DataFrame) -> tuple[pd.DataFram
     else:
         numeric_features = csr_matrix((len(anime_lookup), 0), dtype=np.float32)
 
+    #gộp các phần thành ma trận và chuẩn hóa
     content_matrix = normalize(hstack([genre_features, type_features, numeric_features]).tocsr())
     return anime_lookup, content_matrix
 
-
+#chuẩn hóa tiêu đề về 1 dạng thống nhất
 def normalize_title(title: object) -> str:
     if pd.isna(title):
         return ""
@@ -159,26 +178,30 @@ def normalize_title(title: object) -> str:
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
-
+#tính toán tỉ lệ trùng nhau ở tiêu đề anime
 def shared_prefix_ratio(query_title: str, candidate_title: str) -> float:
+    #tách từ
     query_tokens = query_title.split()
     candidate_tokens = candidate_title.split()
     if not query_tokens or not candidate_tokens:
         return 0.0
 
+    #đếm số từ trùng nhau
     prefix_len = 0
     for query_token, candidate_token in zip(query_tokens, candidate_tokens):
         if query_token != candidate_token:
             break
         prefix_len += 1
 
+    #nếu bộ phim có từ 2 từ trở lên thì phần trùng nhau phải có 2 từ trở lên
     min_len = min(len(query_tokens), len(candidate_tokens))
     if prefix_len < min(3, min_len):
         return 0.0
 
+    #trả về tỉ lệ dựa trên tên dài hơn
     return prefix_len / max(len(query_tokens), len(candidate_tokens))
 
-
+#so sánh tiêu đề của anime này với toàn bộ anime khác
 def title_similarity_scores(anime_lookup: pd.DataFrame, query_idx: int) -> np.ndarray:
     query_title = normalize_title(anime_lookup.iloc[query_idx].get("name", ""))
     query_tokens = set(query_title.split())
@@ -283,7 +306,7 @@ def rerank_with_current_title_rules(
 def existing_columns(frame: pd.DataFrame, columns: list[str]) -> list[str]:
     return [column for column in columns if column in frame.columns]
 
-
+#tính độ tương đồng
 def content_similar_anime(
     anime_lookup: pd.DataFrame,
     content_matrix: csr_matrix,
@@ -302,6 +325,7 @@ def content_similar_anime(
     scores = (1.0 - title_weight) * content_scores + title_weight * title_scores
     scores[query_idx] = -np.inf
 
+    #lấy top k phần tử điểm cao nhất
     n_items = len(scores)
     effective_top_k = min(max(int(top_k), 1), n_items - 1)
     if effective_top_k <= 0:
@@ -319,7 +343,7 @@ def content_similar_anime(
     result["title_similarity"] = title_scores[top_indices]
     return result.reset_index(drop=True)
 
-
+#phân chia thể loại dựa theo tâm trạng người dùng muốn xem bộ anime như nào
 MOOD_GENRE_MAP = {
     "Không chọn": [],
     "Nhẹ nhàng": ["Comedy", "Slice of Life", "Romance"],
@@ -329,17 +353,19 @@ MOOD_GENRE_MAP = {
     "Phiêu lưu / fantasy": ["Adventure", "Fantasy", "Magic", "Supernatural"],
 }
 
-
+#quét toàn bộ dữ liệu để lấy tất cả thể loại anime
 def get_available_genres(anime_lookup: pd.DataFrame) -> list[str]:
     genre_values = anime_lookup.get("genre", pd.Series(dtype=str)).dropna().astype(str)
     genres = {genre.strip() for value in genre_values for genre in value.split(",") if genre.strip()}
     return sorted(genres)
 
-
+#tính mức độ phổ biến cho 1 anime
 def add_popularity_features(
     anime_lookup: pd.DataFrame,
     selected_genres: list[str] | None = None,
 ) -> pd.DataFrame:
+    
+    #điểm dựa trên mức độ khớp thể loại
     result = anime_lookup.copy()
     selected_genres = selected_genres or []
     selected_genre_set = set(selected_genres)
@@ -352,6 +378,7 @@ def add_popularity_features(
     else:
         result["genre_match_count"] = 0
 
+    #điểm dựa trên rating và lượng người xem
     rating = pd.to_numeric(result.get("rating", pd.Series(0, index=result.index)), errors="coerce").fillna(0.0)
     members = pd.to_numeric(result.get("members", pd.Series(0, index=result.index)), errors="coerce").fillna(0.0)
     members = np.log1p(members)
@@ -368,7 +395,7 @@ def add_popularity_features(
     )
     return result
 
-
+#lọc dữ liệu thành 1 tập các anime dựa theo đầu vào của người dùng
 def filter_preference_segment(
     anime_lookup: pd.DataFrame,
     selected_genres: list[str],
@@ -379,10 +406,12 @@ def filter_preference_segment(
     target_genres = list(dict.fromkeys([*selected_genres, *mood_genres]))
     segment = anime_lookup.copy()
 
+    #lọc theo định dạng phim (Movie, TV, ...)
     if selected_types:
         type_text = segment.get("type", pd.Series("", index=segment.index)).fillna("").astype(str)
         segment = segment[type_text.isin(selected_types)].copy()
 
+    #lọc theo thể loại
     if target_genres:
         genre_set = set(target_genres)
         genre_text = segment.get("genre", pd.Series("", index=segment.index)).fillna("").astype(str)
@@ -390,15 +419,17 @@ def filter_preference_segment(
             genre_text.apply(lambda value: bool({part.strip() for part in value.split(",")} & genre_set))
         ].copy()
 
+    #tính điểm rồi sắp xếp
     segment = add_popularity_features(segment, target_genres)
     segment = segment.sort_values(["genre_match_count", "popularity_score"], ascending=False)
     return segment.reset_index(drop=True), target_genres
 
-
+#tính tỉ lệ alpha để cân bằng giữa sở thích cá nhân (content_based) và xu hướng chung
+#tick ít -> alpha cao ->  dựa theo xu hướng chung nhiều hơn
 def dynamic_content_alpha(n_known: int, c: float = 8.0, alpha_min: float = 0.2, alpha_max: float = 0.9) -> float:
     return float(np.clip(c / (c + max(n_known, 0)), alpha_min, alpha_max))
 
-
+#tạo danh sách 10 bộ phim phù hợp nhất
 def recommend_for_new_viewer(
     anime_lookup: pd.DataFrame,
     content_matrix: csr_matrix,
@@ -409,6 +440,7 @@ def recommend_for_new_viewer(
     top_k: int = 10,
     refresh_page: int = 0,
 ) -> tuple[pd.DataFrame, float, str]:
+    #lọc để lấy các anime phù hợp định dạng, thể loại, tâm trạng
     segment, target_genres = filter_preference_segment(
         anime_lookup=anime_lookup,
         selected_genres=selected_genres,
@@ -419,10 +451,12 @@ def recommend_for_new_viewer(
     if segment.empty:
         return pd.DataFrame(), alpha, "empty"
 
+    #loại các anime đã xem
     id_to_idx = {anime_id: idx for idx, anime_id in enumerate(anime_lookup["anime_id"].tolist())}
     known_anime_ids = [int(anime_id) for anime_id in known_anime_ids if int(anime_id) in id_to_idx]
     candidate = segment[~segment["anime_id"].isin(known_anime_ids)].copy()
 
+    #người dùng có chọn tick các anime => dựa trên sở thích để tìm phim
     if known_anime_ids:
         known_indices = [id_to_idx[anime_id] for anime_id in known_anime_ids]
         profile_vector = content_matrix[known_indices].mean(axis=0)
@@ -436,11 +470,13 @@ def recommend_for_new_viewer(
             + (1.0 - alpha) * candidate["popularity_score"].fillna(0.0)
         )
         reason = "profile"
+    #người dùng không tick anime nào => chỉ dựa trên độ phổ biến của anime
     else:
         candidate["content_score"] = np.nan
         candidate["recommendation_score"] = candidate["popularity_score"]
         reason = "segment_popular"
 
+    #phân trang
     candidate = candidate.sort_values(
         ["recommendation_score", "genre_match_count", "popularity_score"],
         ascending=False,
@@ -449,6 +485,7 @@ def recommend_for_new_viewer(
     if start >= len(candidate):
         start = 0
 
+    #lấy số lượng phim theo yêu cầu và lấy các cột thông tin cần thiết
     columns = ["anime_id", "name", "genre", "type", "rating", "members", "recommendation_score"]
     result = candidate.iloc[start : start + top_k][columns].copy()
     result["matched_genres"] = ", ".join(target_genres) if target_genres else "All"
@@ -527,13 +564,14 @@ def get_poster_batch(batch: pd.DataFrame) -> dict[int, bytes | None]:
 
     return poster_map
     
-
+#hiển thị bảng kết quả dưới dạng ô lưới các hình ảnh
 def display_anime_cards(df, columns_per_row=5):
     """Hiển thị lưới anime với ảnh lấy theo tên"""
     n_results = len(df)
     if n_results == 0:
         return
 
+    #chia mỗi hàng có columns_per_row bộ anime
     for i in range(0, n_results, columns_per_row):
         cols = st.columns(columns_per_row)
         batch = df.iloc[i : i + columns_per_row]
@@ -597,27 +635,9 @@ def show_query_result(
 
         #hiển thị poster
         display_anime_cards(similar_df, columns_per_row=5)
-
-        #dataframe để hiện kết quả dạng bảng chữ
-        #st.dataframe(
-        #    similar_df[
-        #        existing_columns(
-        #           similar_df,
-        #            [
-        #                "anime_id",
-        #                "name",
-        #                "genre",
-        #                "type",
-        #                "content_similarity",
-        #                "metadata_similarity",
-        #                "title_similarity",
-        #            ],
-        #        )
-        #    ],
-        #    use_container_width=True,
-        #)
         return
 
+    #Anime này đã có trong ALS model => dùng hybrid
     similar_df = model.hybrid_similar_anime(
         query_anime_id,
         anime_lookup,
@@ -637,28 +657,9 @@ def show_query_result(
 
     #hiển thị poster
     display_anime_cards(similar_df, columns_per_row=5)
-        
-    #dataframe để hiện kết quả dạng bảng chữ
-    #st.dataframe(
-    #    similar_df[
-    #        existing_columns(
-    #            similar_df,
-    #           [
-    #                "anime_id",
-    #                "name",
-    #                "genre",
-    #                "type",
-    #                "hybrid_score",
-    #                "als_similarity",
-    #                "content_similarity",
-    #                "title_similarity",
-    #            ],
-    #        )
-    #    ],
-    #    use_container_width=True,
-    #)
+    
 
-
+#gợi ý cho người mới
 def show_new_viewer_recommendations(
     anime_lookup: pd.DataFrame,
     content_matrix: csr_matrix,
@@ -693,7 +694,9 @@ def show_new_viewer_recommendations(
     
     return
 
+#tiêu đề web
 st.title("Anime Recommender System")
+#mô tả hệ thống
 st.write("Hybrid = ALS collaborative similarity + content similarity from genre, type, rating, and members.")
 st.write("Power by Save AI")
 st.markdown(
